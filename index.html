@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<meta name="referrer" content="no-referrer">
+<title>CoreMotionCadenceLab · E-W1 传感器诊断</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<div class="mock-ribbon" id="mock-ribbon" hidden>MOCK · 合成数据，非真实传感器</div>
+
+<header class="topbar">
+  <div class="topbar-main">
+    <h1>CoreMotionCadenceLab</h1>
+    <p class="sub">阶段 E-W1 · Safari DeviceMotion 兼容性与采集诊断</p>
+  </div>
+  <div class="topbar-badges">
+    <span class="badge" id="badge-context">上下文检测中</span>
+    <span class="badge" id="badge-source">来源：—</span>
+  </div>
+</header>
+
+<main>
+  <section class="card" id="card-env">
+    <div class="card-head">
+      <h2>① 环境自检</h2>
+      <span class="verdict" id="env-verdict">检测中…</span>
+    </div>
+    <p class="note">
+      iOS 上传感器事件不触发时<strong>不会报错</strong>，只会静默无声。所以下列每一项都必须能看到明确结论。
+    </p>
+    <ul class="check-list" id="env-list">
+      <li class="check-empty">正在检测…</li>
+    </ul>
+  </section>
+
+  <section class="card" id="card-perm">
+    <div class="card-head">
+      <h2>② 运动权限</h2>
+      <span class="verdict" id="perm-verdict">未请求</span>
+    </div>
+    <p class="note" id="perm-note">
+      权限请求必须由真实点击触发，且请求调用不能夹在任何 <code>await</code> 或 <code>setTimeout</code> 之后，
+      否则会丢失手势状态并被 Safari 拒绝。
+    </p>
+    <div class="btn-row">
+      <button class="btn btn-primary" id="btn-request" type="button">请求运动权限</button>
+      <button class="btn" id="btn-start" type="button" disabled>开始采集</button>
+      <button class="btn" id="btn-stop" type="button" disabled>停止</button>
+      <button class="btn" id="btn-reset" type="button" disabled>清空数据</button>
+    </div>
+    <p class="result" id="perm-result"></p>
+    <p class="warn-line" id="perm-hint" hidden></p>
+  </section>
+
+  <section class="card" id="card-live">
+    <div class="card-head">
+      <h2>③ 实时加速度</h2>
+      <span class="verdict" id="live-state">空闲</span>
+    </div>
+    <div class="metric-block">
+      <h3>含重力 <span class="unit">accelerationIncludingGravity · m/s²</span></h3>
+      <div class="grid grid-4">
+        <div class="metric"><span class="k">x</span><span class="v" id="m-agx">—</span></div>
+        <div class="metric"><span class="k">y</span><span class="v" id="m-agy">—</span></div>
+        <div class="metric"><span class="k">z</span><span class="v" id="m-agz">—</span></div>
+        <div class="metric metric-em"><span class="k">|a|</span><span class="v" id="m-agmag">—</span></div>
+      </div>
+    </div>
+    <div class="metric-block">
+      <h3>线性 <span class="unit">acceleration · m/s²（设备无陀螺仪时为 null）</span></h3>
+      <div class="grid grid-4">
+        <div class="metric"><span class="k">x</span><span class="v" id="m-ax">—</span></div>
+        <div class="metric"><span class="k">y</span><span class="v" id="m-ay">—</span></div>
+        <div class="metric"><span class="k">z</span><span class="v" id="m-az">—</span></div>
+        <div class="metric metric-em"><span class="k">|a|</span><span class="v" id="m-almag">—</span></div>
+      </div>
+    </div>
+    <div class="metric-block">
+      <h3>角速度 <span class="unit">rotationRate · deg/s</span></h3>
+      <div class="grid grid-3">
+        <div class="metric"><span class="k">α</span><span class="v" id="m-alpha">—</span></div>
+        <div class="metric"><span class="k">β</span><span class="v" id="m-beta">—</span></div>
+        <div class="metric"><span class="k">γ</span><span class="v" id="m-gamma">—</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card" id="card-rate">
+    <div class="card-head">
+      <h2>④ 到达频率与中断监测</h2>
+      <span class="verdict" id="rate-state">空闲</span>
+    </div>
+    <div class="grid grid-5">
+      <div class="metric"><span class="k">实测频率</span><span class="v" id="m-hz">—</span><span class="u">Hz</span></div>
+      <div class="metric"><span class="k">事件总数</span><span class="v" id="m-count">0</span></div>
+      <div class="metric"><span class="k">已采时长</span><span class="v" id="m-elapsed">0.0</span><span class="u">s</span></div>
+      <div class="metric"><span class="k">距上一事件</span><span class="v" id="m-since">—</span><span class="u">ms</span></div>
+      <div class="metric"><span class="k">中断次数</span><span class="v" id="m-gaps">0</span></div>
+    </div>
+    <div class="grid grid-4 mt">
+      <div class="metric"><span class="k">中位间隔</span><span class="v" id="m-median">—</span><span class="u">ms</span></div>
+      <div class="metric"><span class="k">P95 间隔</span><span class="v" id="m-p95">—</span><span class="u">ms</span></div>
+      <div class="metric"><span class="k">抖动 P95</span><span class="v" id="m-jitter">—</span><span class="u">ms</span></div>
+      <div class="metric"><span class="k">设备自报间隔</span><span class="v" id="m-declared">—</span><span class="u">ms</span></div>
+    </div>
+
+    <h3 class="chart-title">每秒事件数（最近 120 秒）</h3>
+    <div class="chart-wrap">
+      <canvas id="rate-canvas" width="640" height="110"></canvas>
+    </div>
+    <p class="note chart-note">
+      柱高为每秒事件数，红色空白表示该秒零事件。iOS 在页面切后台或锁屏时事件会直接停掉，
+      这一栏是判断"数据断了"还是"传感器没数据"的唯一客观依据。
+    </p>
+
+    <h3 class="chart-title">中断记录</h3>
+    <div class="table-wrap">
+      <table class="gap-table">
+        <thead>
+          <tr><th>序号</th><th>起始</th><th>持续</th><th>级别</th><th>归因</th></tr>
+        </thead>
+        <tbody id="gap-body">
+          <tr><td colspan="5" class="empty">暂无中断</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card" id="card-export">
+    <div class="card-head">
+      <h2>⑤ 数据源与导出</h2>
+      <span class="verdict" id="export-state">—</span>
+    </div>
+    <div class="field-row">
+      <label class="field">
+        <span>数据源</span>
+        <select id="sel-source">
+          <option value="real">真实传感器（Safari）</option>
+          <option value="mock">模拟数据（合成，MOCK）</option>
+        </select>
+      </label>
+      <label class="field" id="field-preset" hidden>
+        <span>模拟场景</span>
+        <select id="sel-preset">
+          <option value="walk">步行 120</option>
+          <option value="jog">慢跑 170</option>
+          <option value="handheld">手持静止</option>
+          <option value="still">静止</option>
+        </select>
+      </label>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-primary" id="btn-export-csv" type="button" disabled>导出原始事件 CSV</button>
+      <button class="btn" id="btn-export-json" type="button" disabled>导出诊断 JSON</button>
+    </div>
+    <p class="result" id="export-result"></p>
+    <p class="source-line" id="export-source">来源待定</p>
+    <p class="net-line" id="net-counter">网络请求计数启动中…</p>
+    <p class="note">
+      导出文件名一律带 <code>_WEB_REAL</code> 或 <code>_WEB_MOCK</code>；CSV 每行第 14、15 列分别是
+      <code>source</code>（REAL / MOCK）与 <code>sensor</code>（devicemotion / synth）。
+      所有数据只在浏览器内生成，导出即本地下载，不上传任何第三方。
+    </p>
+  </section>
+
+  <section class="card card-quiet">
+    <div class="card-head"><h2>阶段说明</h2></div>
+    <ul class="plain-list">
+      <li><strong>本阶段不产出步频。</strong>步频估算算法计划在 E-W3 实现，此处若显示任何步数或步频即为伪造。</li>
+      <li><strong>页面必须顶层打开。</strong>iOS 26 存在 iframe 内 <code>devicemotion</code> 不派发的已知缺陷（WebKit Bug 301294）。</li>
+      <li><strong>屏幕需保持常亮。</strong>锁屏或切到后台，iOS 会挂起事件派发。</li>
+      <li><strong>与 Core Motion 的关系：</strong>本页读的是原始加速度，不是 <code>CMPedometer</code> 的计步结论，两者不可互换声明。</li>
+    </ul>
+    <p class="footer-meta" id="footer-meta">契约版本 1.0</p>
+  </section>
+</main>
+
+<script type="module" src="./js/app.js"></script>
+</body>
+</html>
