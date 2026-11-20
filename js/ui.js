@@ -117,11 +117,28 @@ export function renderLiveMetrics(refs, ev) {
   set("m-gamma", fmt(ev.gamma, 1));
 }
 
-/** 渲染中断记录表。 */
-export function renderGaps(tbody, gaps, originMs) {
+/**
+ * 渲染中断与停顿记录表。
+ *
+ * 中断（≥1000ms）和停顿（200–999ms）合并到一张表里按时间排序，
+ * 但"类型"列必须分开写：两者含义不同（一个是真断了，一个是迟滞），
+ * 混成一类会让读者低估数据空档的密度。
+ *
+ * @param {HTMLElement} tbody
+ * @param {Array} gaps   中断
+ * @param {number|null} originMs
+ * @param {Array} [stalls] 停顿
+ */
+export function renderGaps(tbody, gaps, originMs, stalls = []) {
   if (!tbody) return;
   tbody.textContent = "";
-  if (!gaps.length) {
+
+  const rows = [
+    ...(gaps || []).map((g) => ({ ...g, kind: g.level === "fail" ? "中断" : "迟滞" })),
+    ...(stalls || []).map((s) => ({ ...s, kind: "停顿" })),
+  ].sort((a, b) => a.startMs - b.startMs);
+
+  if (!rows.length) {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
     td.colSpan = 5;
@@ -132,27 +149,29 @@ export function renderGaps(tbody, gaps, originMs) {
     return;
   }
 
-  const recent = gaps.slice(-20);
-  recent.forEach((gap, i) => {
+  const recent = rows.slice(-20);
+  recent.forEach((row, i) => {
     const tr = document.createElement("tr");
 
     const idx = document.createElement("td");
-    idx.textContent = String(gaps.length - recent.length + i + 1);
+    idx.textContent = String(rows.length - recent.length + i + 1);
+
+    const kind = document.createElement("td");
+    kind.textContent = row.kind;
+    if (row.kind === "中断") kind.className = "kind-fail";
+    else if (row.kind === "停顿") kind.className = "kind-stall";
 
     const start = document.createElement("td");
-    start.textContent = fmtOffset(gap.startMs, originMs);
+    start.textContent = fmtOffset(row.startMs, originMs);
 
     const dur = document.createElement("td");
-    dur.textContent = `${(gap.durationMs / 1000).toFixed(2)}s`;
-
-    const level = document.createElement("td");
-    level.textContent = gap.level === "fail" ? "中断" : "迟滞";
+    dur.textContent = `${(row.durationMs / 1000).toFixed(2)}s`;
 
     const cause = document.createElement("td");
-    cause.textContent = gap.cause === "hidden" ? "页面隐藏" : "原因未知";
-    if (gap.cause === "hidden") cause.className = "cause-hidden";
+    cause.textContent = row.cause === "hidden" ? "页面隐藏" : "原因未知";
+    if (row.cause === "hidden") cause.className = "cause-hidden";
 
-    tr.append(idx, start, dur, level, cause);
+    tr.append(idx, kind, start, dur, cause);
     tbody.appendChild(tr);
   });
 }

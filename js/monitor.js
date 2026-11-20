@@ -16,6 +16,18 @@ export const DEFAULT_GAP_WARN_MS = 1000;
 export const DEFAULT_GAP_FAIL_MS = 3000;
 
 /**
+ * 停顿阈值（E-W2 新增）。
+ *
+ * E-W1 真机数据暴露的问题：只记 ≥1000ms 的中断会漏掉大量 200–999ms 的停顿。
+ * 那次采集里有一段 965ms 的停顿，比阈值只差 35ms，没被计为中断，
+ * 却足以把 2 秒滑窗频率从 58.8Hz 拉到 31Hz —— 看板上"频率忽然掉一半"
+ * 却找不到任何中断记录，是很容易误判成算法出问题的。
+ *
+ * 所以把 200ms–999ms 单独记成"停顿"，既不改中断的定义，也不让空档消失。
+ */
+export const DEFAULT_STALL_MS = 200;
+
+/**
  * @typedef {object} MotionEventRecord
  * @property {number} tMonoMs      单调时钟毫秒（由数据源用 performance.now() 提供）
  * @property {number|null} agx     含重力加速度 x（m/s²）
@@ -43,9 +55,13 @@ export class MotionMonitor {
    */
   constructor(opts = {}) {
     this.eventCapacity = opts.eventCapacity ?? 30000;
-    this.intervalCapacity = opts.intervalCapacity ?? 4096;
+    // E-W1 用的是 4096。真机一次 181 秒的采集就有 4674 个间隔，
+    // 前 578 个被静默挤掉，导致 mean/median/p95 全部只反映"最后 4096 个"。
+    // 现在放大到 60000（约 16 分钟 @60Hz），并且一旦发生截断必须显式报告。
+    this.intervalCapacity = opts.intervalCapacity ?? 60000;
     this.gapWarnMs = opts.gapWarnMs ?? DEFAULT_GAP_WARN_MS;
     this.gapFailMs = opts.gapFailMs ?? DEFAULT_GAP_FAIL_MS;
+    this.stallMs = opts.stallMs ?? DEFAULT_STALL_MS;
     this.hzWindowMs = opts.hzWindowMs ?? 2000;
     this.bucketMs = opts.bucketMs ?? 1000;
     this.bucketCount = opts.bucketCount ?? 120;
@@ -61,13 +77,20 @@ export class MotionMonitor {
     this._intervals = new Array(this.intervalCapacity);
     this._iHead = 0;
     this._iSize = 0;
+    this._intervalDropped = 0;
 
     this._buckets = new Map(); // tSec -> count
     this._gaps = [];
+    this._stalls = [];
     this._visibility = [{ state: "visible", atMs: 0 }];
 
     this.totalPushed = 0;
     this.rejectedCount = 0;
+    // 丢弃原因分解：E-W1 真机数据里有 7 个事件被丢，但只留了一个总数，
+    // 事后无法判断是"同一毫秒撞车"还是"时间源倒退"。这个信息本该在采集时就留下。
+    this._rejectedNonFinite = 0;
+    this._rejectedTie = 0;
+    this._rejectedBackwards = 0;
     this._firstMs = null;
     this._lastMs = null;
     this._finalized = false;
@@ -82,10 +105,15 @@ export class MotionMonitor {
     const t = ev.tMonoMs;
     if (!Number.isFinite(t)) {
       this.rejectedCount += 1;
+      this._rejectedNonFinite += 1;
       return false;
     }
     if (this._lastMs !== null && t <= this._lastMs) {
       this.rejectedCount += 1;
+      // 再分一层：相等和倒退是不同的病。相等多半是同一毫秒内连发两个事件；
+      // 倒退说明时间源出了问题，性质严重得多，不该和"同毫秒撞车"混成一个数。
+      if (t === this._lastMs) this._rejectedTie += 1;
+      else this._rejectedBackwards += 1;
       return false;
     }
 
@@ -98,6 +126,14 @@ export class MotionMonitor {
           endMs: t,
           durationMs: dt,
           level: dt > this.gapFailMs ? "fail" : "warn",
+          cause: this._attributeCause(this._lastMs, t),
+        });
+      } else if (dt >= this.stallMs) {
+        // 够不上中断，但也不是正常间隔：单独记一笔，不让空档凭空消失
+        this._stalls.push({
+          startMs: this._lastMs,
+          endMs: t,
+          durationMs: dt,
           cause: this._attributeCause(this._lastMs, t),
         });
       }
@@ -191,10 +227,24 @@ export class MotionMonitor {
       .filter((v) => typeof v === "number" && Number.isFinite(v) && v >= 0);
     const declaredIntervalMeanMs = declared.length ? mean(declared) : 0;
 
-    const observedHz = this._observedHz(events, nowMs);
+    // 三种频率口径必须同时给出，否则读者无法判断"这个 Hz 是什么的 Hz"。
+    // E-W1 只导出了滑窗值，结果 30.98Hz 被误当成"本次采集频率"（真实有效采集率 57.8Hz）。
+    const windowHz = this._observedHz(events, nowMs);
+    const sessionAverageHz = elapsedMs > 0 ? ((count - 1) / elapsedMs) * 1000 : 0;
 
     const gapTotalMs = this._gaps.reduce((acc, g) => acc + g.durationMs, 0);
     const longestGapMs = this._gaps.reduce((acc, g) => Math.max(acc, g.durationMs), 0);
+
+    // 有效采集率：把中断时段从分母里剔掉，把中断的那一个间隔从分子里剔掉。
+    // 尾部补记的中断不算——它出现在 elapsedMs 之外，本来就不在分子分母里。
+    const innerGaps = this._gaps.filter((g) => !g.trailing);
+    const innerGapMs = innerGaps.reduce((acc, g) => acc + g.durationMs, 0);
+    const activeSpanMs = Math.max(0, elapsedMs - innerGapMs);
+    const activeSamples = Math.max(0, count - 1 - innerGaps.length);
+    const activeHz = activeSpanMs > 0 ? (activeSamples / activeSpanMs) * 1000 : 0;
+
+    const stallTotalMs = this._stalls.reduce((acc, s) => acc + s.durationMs, 0);
+    const longestStallMs = this._stalls.reduce((acc, s) => Math.max(acc, s.durationMs), 0);
 
     const interruptLevel =
       sinceLastMs > this.gapFailMs ? "fail" : sinceLastMs > this.gapWarnMs ? "warn" : "none";
@@ -206,13 +256,22 @@ export class MotionMonitor {
       eventCount: count,
       totalPushed: this.totalPushed,
       rejectedCount: this.rejectedCount,
+      rejectedNonFinite: this._rejectedNonFinite,
+      rejectedTie: this._rejectedTie,
+      rejectedBackwards: this._rejectedBackwards,
       bufferedCapacity: this.eventCapacity,
       firstMs,
       lastMs,
       elapsedMs,
       sinceLastMs,
-      observedHz,
+      windowHz,
+      sessionAverageHz,
+      activeHz,
+      activeSpanMs,
       intervalSampleCount: intervals.length,
+      intervalCapacity: this.intervalCapacity,
+      intervalDroppedCount: this._intervalDropped,
+      intervalStatsTruncated: this._intervalDropped > 0,
       meanIntervalMs,
       medianIntervalMs,
       p50IntervalMs,
@@ -225,6 +284,11 @@ export class MotionMonitor {
       gapTotalMs,
       longestGapMs,
       gaps: this._gaps.slice(),
+      stallMs: this.stallMs,
+      stallCount: this._stalls.length,
+      stallTotalMs,
+      longestStallMs,
+      stalls: this._stalls.slice(),
       interruptLevel,
       state,
       perSecond: this._perSecondSeries(nowMs),
@@ -240,6 +304,7 @@ export class MotionMonitor {
   }
 
   _pushInterval(dt) {
+    if (this._iSize === this.intervalCapacity) this._intervalDropped += 1;
     this._intervals[this._iHead] = dt;
     this._iHead = (this._iHead + 1) % this.intervalCapacity;
     if (this._iSize < this.intervalCapacity) this._iSize += 1;

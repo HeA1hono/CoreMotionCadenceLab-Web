@@ -47,6 +47,12 @@ function defaultTimerApi() {
  *   - rotationRate 可能为 null。
  * 任何一项都不得让监听器抛异常——一旦抛，事件流就断了。
  *
+ * 【单位】`DeviceMotionEvent.interval` 按 W3C 规范是**秒**，不是毫秒。
+ *   E-W1 真机数据把这一点坐实了：iPhone 13 上该字段恒为 0.016667，
+ *   即 1/60 秒；而同一批事件的实际时间戳间隔中位数是 17ms。
+ *   若原样写进 `interval_ms` 列，列名与内容就差了 1000 倍。
+ *   此处统一 ×1000 转成毫秒，与合成源、CSV 列名、UI 单位保持一致。
+ *
  * @param {object} event DeviceMotionEvent 或其等价结构
  * @param {number} nowMs 单调时钟毫秒
  */
@@ -54,6 +60,7 @@ export function normalizeMotionEvent(event, nowMs) {
   const ag = (event && event.accelerationIncludingGravity) || null;
   const lin = (event && event.acceleration) || null;
   const rr = (event && event.rotationRate) || null;
+  const rawIntervalSec = numOrNull(event && event.interval);
 
   return {
     tMonoMs: nowMs,
@@ -66,7 +73,8 @@ export function normalizeMotionEvent(event, nowMs) {
     alpha: rr ? numOrNull(rr.alpha) : null,
     beta: rr ? numOrNull(rr.beta) : null,
     gamma: rr ? numOrNull(rr.gamma) : null,
-    intervalMs: numOrNull(event && event.interval),
+    intervalMs: rawIntervalSec === null ? null : rawIntervalSec * 1000,
+    intervalSecRaw: rawIntervalSec,
     hasLinearAcceleration: Boolean(lin && numOrNull(lin.x) !== null),
   };
 }

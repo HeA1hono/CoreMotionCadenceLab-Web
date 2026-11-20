@@ -12,6 +12,13 @@ import {
 import { MotionMonitor } from "./monitor.js";
 import { RealMotionSource, MockMotionSource, SourceState } from "./sources.js";
 import {
+  WaveformBuffer,
+  CHANNELS,
+  computeYRange,
+  drawWaveform,
+} from "./waveform.js";
+import { CalibrationModel } from "./calibration.js";
+import {
   renderEnvList,
   renderLiveMetrics,
   renderGaps,
@@ -32,7 +39,7 @@ import {
 } from "./export.js";
 import { makeWebSessionId, CONTRACT_VERSION } from "./contract.js";
 
-const APP_VERSION = "0.1.0";
+const APP_VERSION = "0.2.0";
 const UPDATE_INTERVAL_MS = 200;
 /** 本机开发服务器端点。仅在 localhost 下才会被使用，见 isLocalDevHost()。 */
 const DEV_SAVE_ENDPOINT = "/api/save";
@@ -71,17 +78,32 @@ const dom = {
   btnExportJson: el("btn-export-json"),
   liveState: el("live-state"),
   rateState: el("rate-state"),
-  mHz: el("m-hz"),
+  mWindowHz: el("m-window-hz"),
+  mActiveHz: el("m-active-hz"),
+  mAvgHz: el("m-avg-hz"),
   mCount: el("m-count"),
   mElapsed: el("m-elapsed"),
   mSince: el("m-since"),
   mGaps: el("m-gaps"),
+  mGapTotal: el("m-gap-total"),
+  mStallCount: el("m-stall-count"),
   mMedian: el("m-median"),
   mP95: el("m-p95"),
   mJitter: el("m-jitter"),
   mDeclared: el("m-declared"),
   canvas: el("rate-canvas"),
+  waveAxes: el("wave-axes"),
+  waveMags: el("wave-mags"),
+  waveState: el("wave-state"),
+  selWindow: el("sel-window"),
+  selScale: el("sel-scale"),
+  chips: el("chips"),
+  btnCalibrate: el("btn-calibrate"),
+  calibState: el("calib-state"),
+  calibNote: el("calib-note"),
   gapBody: el("gap-body"),
+  truncNote: el("trunc-note"),
+  rejectNote: el("reject-note"),
   selSource: el("sel-source"),
   selPreset: el("sel-preset"),
   fieldPreset: el("field-preset"),
@@ -105,8 +127,22 @@ const state = {
   updateTimer: null,
   stats: null,
   lastChartDrawMs: 0,
+  lastWaveDrawMs: 0,
   networkCalls: 0,
   networkLog: [],
+  // E-W2：波形缓冲。每个通道独立一条，容量 8192 ≈ 60Hz 下 136 秒，
+  // 覆盖最长的 60 秒时间窗且留足余量。
+  wave: {
+    agx: new WaveformBuffer(8192),
+    agy: new WaveformBuffer(8192),
+    agz: new WaveformBuffer(8192),
+    agmag: new WaveformBuffer(8192),
+    lmag: new WaveformBuffer(8192),
+  },
+  channels: { agx: true, agy: true, agz: true, agmag: true, lmag: true },
+  windowMs: 5000,
+  scaleMode: "auto",
+  calib: new CalibrationModel({ samplesNeeded: 90 }),
 };
 
 /**
@@ -290,7 +326,149 @@ function handleSourceState(sourceState) {
 
 function handleEvent(record) {
   const accepted = state.monitor.push(record);
-  if (accepted) state.lastEvent = record;
+  if (!accepted) return;
+  state.lastEvent = record;
+  pushWave(record);
+
+  if (state.calib.capturing) {
+    state.calib.addSample({ x: record.agx, y: record.agy, z: record.agz });
+    if (state.calib.sampleCount >= state.calib.samplesNeeded) finishCalibration();
+    else updateCalibUi();
+  }
+}
+
+function magnitudeOf(x, y, z) {
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return null;
+  return Math.sqrt(x * x + y * y + z * z);
+}
+
+/**
+ * 写入波形缓冲。
+ *
+ * 三轴与"含重力模长"走校准后的值；"线性模长"直接用 iOS 已经去过重力的
+ * `acceleration`，不再叠加校准——否则等于去两次重力，静止时会读到负值。
+ */
+function pushWave(rec) {
+  const t = rec.tMonoMs;
+  const cal = state.calib.apply({ x: rec.agx, y: rec.agy, z: rec.agz });
+  state.wave.agx.push(t, cal.x);
+  state.wave.agy.push(t, cal.y);
+  state.wave.agz.push(t, cal.z);
+  state.wave.agmag.push(t, magnitudeOf(cal.x, cal.y, cal.z));
+  state.wave.lmag.push(t, magnitudeOf(rec.ax, rec.ay, rec.az));
+}
+
+/** 波形锚点：采集时跟当前时刻走，停止后钉在最后一个事件上，避免画面滚成空白。 */
+function waveAnchor(nowMs) {
+  if (state.running) return nowMs;
+  if (state.lastEvent) return state.lastEvent.tMonoMs;
+  return nowMs;
+}
+
+function plotColumns(canvas) {
+  const w = canvas && canvas.clientWidth ? canvas.clientWidth : 300;
+  return Math.max(1, Math.round(w - 30)); // 30 = 左侧刻度留白
+}
+
+function renderWaveform(nowMs) {
+  const to = waveAnchor(nowMs);
+  const from = to - state.windowMs;
+  const tRange = { from, to };
+
+  const axesKeys = ["agx", "agy", "agz"].filter((k) => state.channels[k]);
+  const magKeys = ["agmag", "lmag"].filter((k) => state.channels[k]);
+
+  const axesSeries = axesKeys.map((k) => ({
+    cols: state.wave[k].columnize(from, to, plotColumns(dom.waveAxes)),
+    color: CHANNELS[k].color,
+    width: 1,
+  }));
+  const magSeries = magKeys.map((k) => ({
+    cols: state.wave[k].columnize(from, to, plotColumns(dom.waveMags)),
+    color: CHANNELS[k].color,
+    width: 1.5,
+  }));
+
+  let axesY;
+  let magsY;
+  if (state.scaleMode === "fixed") {
+    axesY = { min: -20, max: 20 };
+    magsY = { min: 0, max: 40 };
+  } else {
+    axesY = computeYRange(axesSeries.map((s) => s.cols), {
+      minSpan: 4,
+      symmetric: true,
+      padRatio: 0.06,
+    });
+    magsY = computeYRange(magSeries.map((s) => s.cols), {
+      minSpan: 2,
+      symmetric: false,
+      padRatio: 0.06,
+      hardMin: 0, // 模长是矢量的长度，不会小于 0
+    });
+  }
+
+  const dpr = window.devicePixelRatio || 1;
+  drawWaveform(dom.waveAxes, { series: axesSeries, tRange, yRange: axesY, dpr });
+  drawWaveform(dom.waveMags, { series: magSeries, tRange, yRange: magsY, dpr });
+}
+
+// ---------------------------------------------------------------- 校准
+
+function updateCalibUi() {
+  if (!dom.calibState) return;
+  const c = state.calib;
+  if (c.capturing) {
+    const pct = Math.round(c.progress * 100);
+    dom.calibState.textContent = `采集中 ${pct}%`;
+    dom.calibState.className = "calib-state is-capturing";
+    dom.btnCalibrate.textContent = "取消校准";
+    return;
+  }
+  if (c.ready) {
+    const s = c.summary();
+    const mag = s.baseline_magnitude_ms2;
+    dom.calibState.textContent = `已校准 · 基线 ${mag.toFixed(2)} m/s²`;
+    dom.calibState.className = s.plausible_gravity
+      ? "calib-state is-ready"
+      : "calib-state is-warn";
+    dom.btnCalibrate.textContent = "重新校准";
+    if (dom.calibNote) {
+      dom.calibNote.textContent = s.plausible_gravity
+        ? "已减去静止基线：波形以 0 为中心，起伏更容易看清。导出文件仍是未校准的原始值。"
+        : s.warning;
+    }
+    return;
+  }
+  dom.calibState.textContent = "未校准";
+  dom.calibState.className = "calib-state";
+  dom.btnCalibrate.textContent = "校准显示基线";
+}
+
+function finishCalibration() {
+  const ok = state.calib.finish(performance.now());
+  if (!ok) {
+    dom.calibState.textContent = "样本不足，未生效";
+    dom.calibState.className = "calib-state is-warn";
+    return;
+  }
+  updateCalibUi();
+  renderWaveform(performance.now());
+}
+
+function onCalibrateClick() {
+  if (state.calib.capturing) {
+    state.calib.cancel();
+    updateCalibUi();
+    return;
+  }
+  if (!state.running) {
+    dom.calibState.textContent = "需先开始采集";
+    dom.calibState.className = "calib-state is-warn";
+    return;
+  }
+  state.calib.begin(performance.now());
+  updateCalibUi();
 }
 
 // ---------------------------------------------------------------- 权限
@@ -362,6 +540,9 @@ async function onStartClick() {
   state.startedWallMs = Date.now();
   state.visibilityLog = [];
   state.running = true;
+  clearWave();
+  if (state.calib.capturing) state.calib.cancel();
+  updateCalibUi();
 
   // 每次开新会话都换 session_id，避免跨会话数据混在一起
   state.sessionId = makeWebSessionId();
@@ -387,9 +568,11 @@ async function onStartClick() {
   dom.btnReset.disabled = false;
   dom.btnExportCsv.disabled = true;
   dom.btnExportJson.disabled = true;
+  dom.btnCalibrate.disabled = false;
   dom.exportResult.textContent = "";
   setVerdict(dom.liveState, "采集中", "is-ok");
   setVerdict(dom.rateState, "等待事件…", "");
+  setVerdict(dom.waveState, "等待事件…", "");
 
   startUpdateLoop();
 }
@@ -411,10 +594,19 @@ function onStopClick() {
   if (state.sourceKind === "mock") dom.btnStart.disabled = false;
   else dom.btnStart.disabled = false;
 
+  // 停止后仍允许校准——对着已经采到的数据调整显示基线是有意义的
+  dom.btnCalibrate.disabled = false;
+
   const count = state.monitor.totalPushed;
   dom.btnExportCsv.disabled = count === 0;
   dom.btnExportJson.disabled = count === 0;
   setVerdict(dom.rateState, count ? `已停止 · ${count} 个事件` : "已停止 · 无数据", "");
+  setVerdict(dom.waveState, count ? "已停止 · 显示最后一段" : "已停止", "");
+  renderWaveform(performance.now());
+}
+
+function clearWave() {
+  for (const key of Object.keys(state.wave)) state.wave[key].clear();
 }
 
 function onResetClick() {
@@ -423,16 +615,22 @@ function onResetClick() {
   state.stats = null;
   state.startedWallMs = null;
   state.visibilityLog = [];
+  clearWave();
   renderLiveMetrics(refs, null);
-  setMetricText("0", "0.0", "—", "0", "—", "—", "—", "—");
+  setMetricText(EMPTY_METRICS);
   dom.gapBody.textContent = "";
-  renderGaps(dom.gapBody, [], null);
+  renderGaps(dom.gapBody, [], null, []);
+  if (dom.truncNote) dom.truncNote.hidden = true;
+  if (dom.rejectNote) dom.rejectNote.hidden = true;
   drawRateChart(dom.canvas, [], { devicePixelRatio: window.devicePixelRatio || 1 });
+  renderWaveform(performance.now());
   dom.btnExportCsv.disabled = true;
   dom.btnExportJson.disabled = true;
+  dom.btnCalibrate.disabled = true;
   dom.exportResult.textContent = "";
   setVerdict(dom.liveState, "空闲", "");
   setVerdict(dom.rateState, "空闲", "");
+  setVerdict(dom.waveState, "空闲", "");
 }
 
 function startUpdateLoop() {
@@ -449,15 +647,36 @@ function stopUpdateLoop() {
   }
 }
 
-function setMetricText(hz, elapsed, since, gaps, median, p95, jitter, declared) {
-  if (dom.mHz) dom.mHz.textContent = hz;
-  if (dom.mElapsed) dom.mElapsed.textContent = elapsed;
-  if (dom.mSince) dom.mSince.textContent = since;
-  if (dom.mGaps) dom.mGaps.textContent = gaps;
-  if (dom.mMedian) dom.mMedian.textContent = median;
-  if (dom.mP95) dom.mP95.textContent = p95;
-  if (dom.mJitter) dom.mJitter.textContent = jitter;
-  if (dom.mDeclared) dom.mDeclared.textContent = declared;
+const EMPTY_METRICS = Object.freeze({
+  windowHz: "—",
+  activeHz: "—",
+  avgHz: "—",
+  count: "0",
+  elapsed: "0.0",
+  since: "—",
+  gaps: "0",
+  gapTotal: "0.0",
+  stalls: "0",
+  median: "—",
+  p95: "—",
+  jitter: "—",
+  declared: "—",
+});
+
+function setMetricText(m) {
+  if (dom.mWindowHz) dom.mWindowHz.textContent = m.windowHz;
+  if (dom.mActiveHz) dom.mActiveHz.textContent = m.activeHz;
+  if (dom.mAvgHz) dom.mAvgHz.textContent = m.avgHz;
+  if (dom.mCount) dom.mCount.textContent = m.count;
+  if (dom.mElapsed) dom.mElapsed.textContent = m.elapsed;
+  if (dom.mSince) dom.mSince.textContent = m.since;
+  if (dom.mGaps) dom.mGaps.textContent = m.gaps;
+  if (dom.mGapTotal) dom.mGapTotal.textContent = m.gapTotal;
+  if (dom.mStallCount) dom.mStallCount.textContent = m.stalls;
+  if (dom.mMedian) dom.mMedian.textContent = m.median;
+  if (dom.mP95) dom.mP95.textContent = m.p95;
+  if (dom.mJitter) dom.mJitter.textContent = m.jitter;
+  if (dom.mDeclared) dom.mDeclared.textContent = m.declared;
 }
 
 function refreshStats(nowMs, force) {
@@ -466,17 +685,53 @@ function refreshStats(nowMs, force) {
 
   renderLiveMetrics(refs, state.lastEvent);
 
-  if (dom.mCount) dom.mCount.textContent = String(stats.totalPushed);
-  setMetricText(
-    fmtFixed(stats.observedHz, 1),
-    fmtFixed(stats.elapsedMs / 1000, 1),
-    stats.eventCount ? fmtFixed(stats.sinceLastMs, 0) : "—",
-    String(stats.gapCount),
-    stats.intervalSampleCount ? fmtFixed(stats.medianIntervalMs, 1) : "—",
-    stats.intervalSampleCount ? fmtFixed(stats.p95IntervalMs, 1) : "—",
-    stats.intervalSampleCount ? fmtFixed(stats.jitterP95Ms, 1) : "—",
-    stats.declaredIntervalMeanMs ? fmtFixed(stats.declaredIntervalMeanMs, 1) : "—"
-  );
+  setMetricText({
+    windowHz: stats.eventCount ? fmtFixed(stats.windowHz, 1) : "—",
+    activeHz: stats.eventCount ? fmtFixed(stats.activeHz, 1) : "—",
+    avgHz: stats.eventCount ? fmtFixed(stats.sessionAverageHz, 1) : "—",
+    count: String(stats.totalPushed),
+    elapsed: fmtFixed(stats.elapsedMs / 1000, 1),
+    since: stats.eventCount ? fmtFixed(stats.sinceLastMs, 0) : "—",
+    gaps: String(stats.gapCount),
+    gapTotal: fmtFixed(stats.gapTotalMs / 1000, 1),
+    stalls: String(stats.stallCount),
+    median: stats.intervalSampleCount ? fmtFixed(stats.medianIntervalMs, 1) : "—",
+    p95: stats.intervalSampleCount ? fmtFixed(stats.p95IntervalMs, 1) : "—",
+    jitter: stats.intervalSampleCount ? fmtFixed(stats.jitterP95Ms, 1) : "—",
+    declared: stats.declaredIntervalMeanMs ? fmtFixed(stats.declaredIntervalMeanMs, 1) : "—",
+  });
+
+  // 环形缓冲挤掉过旧间隔时必须说出来，否则 mean/median 只代表最近一段，
+  // 读者会以为是全程统计。E-W1 就是因为没说，41.986 和 38.855 两个平均值对不上。
+  if (dom.truncNote) {
+    if (stats.intervalStatsTruncated) {
+      dom.truncNote.hidden = false;
+      dom.truncNote.textContent =
+        `注意：间隔统计只覆盖最近 ${stats.intervalSampleCount} 个间隔` +
+        `（缓冲容量 ${stats.intervalCapacity}，已丢弃 ${stats.intervalDroppedCount} 个更早的）。` +
+        `中位/P95/抖动基于这一段，不代表全程。`;
+    } else {
+      dom.truncNote.hidden = true;
+    }
+  }
+
+  // 被丢弃的事件必须出现在界面上。E-W1 的 7 次丢弃只藏在导出 JSON 的一个数字里，
+  // 界面上一片正常——那不是"没影响"，那是"看不见"。
+  if (dom.rejectNote) {
+    if (stats.rejectedCount > 0) {
+      const parts = [];
+      if (stats.rejectedTie > 0) parts.push(`${stats.rejectedTie} 个与上一事件同一毫秒`);
+      if (stats.rejectedBackwards > 0) parts.push(`${stats.rejectedBackwards} 个时间戳倒退`);
+      if (stats.rejectedNonFinite > 0) parts.push(`${stats.rejectedNonFinite} 个时间戳非法`);
+      dom.rejectNote.hidden = false;
+      dom.rejectNote.textContent =
+        `已拒收 ${stats.rejectedCount} 个事件（共收到 ${stats.totalPushed} 个）：` +
+        `${parts.join("、") || "原因未分类"}。` +
+        `契约要求 t_mono 严格递增，所以这 ${stats.rejectedCount} 个样本没有进入 CSV。`;
+    } else {
+      dom.rejectNote.hidden = true;
+    }
+  }
 
   if (stats.state === "live") {
     setVerdict(dom.rateState, "事件正常", "is-ok");
@@ -488,7 +743,7 @@ function refreshStats(nowMs, force) {
     );
   }
 
-  renderGaps(dom.gapBody, stats.gaps, stats.firstMs);
+  renderGaps(dom.gapBody, stats.gaps, stats.firstMs, stats.stalls);
 
   const now = force ? nowMs : performance.now();
   if (force || now - state.lastChartDrawMs > 1000) {
@@ -497,6 +752,13 @@ function refreshStats(nowMs, force) {
       devicePixelRatio: window.devicePixelRatio || 1,
       startTSec: stats.firstMs === null ? null : Math.floor(stats.firstMs / 1000),
     });
+  }
+
+  // 波形刷新比数字更勤：50ms 一帧 ≈ 20fps，对 60Hz 数据足够顺滑，
+  // 又不至于让手机上每帧都重算 3000 个样本。
+  if (force || now - (state.lastWaveDrawMs || 0) > 50) {
+    state.lastWaveDrawMs = now;
+    renderWaveform(now);
   }
 }
 
@@ -566,6 +828,7 @@ async function onExportJson() {
       environment: summarizeEnvForExport(state.envReport),
       permission: meta.permission,
       stats: summarizeStatsForExport(stats),
+      calibration: state.calib.summary(),
       visibilityLog: meta.visibilityLog,
       appVersion: APP_VERSION,
       generatedAt: meta.generatedAt,
@@ -614,8 +877,17 @@ function summarizeStatsForExport(stats) {
     event_count: stats.eventCount,
     total_pushed: stats.totalPushed,
     rejected_count: stats.rejectedCount,
+    // 丢弃原因分解。只给一个总数等于"知道丢了、不知道为什么丢"，
+    // E-W1 真机数据里那 7 个事件就卡在这个死角里。
+    rejected_non_finite: stats.rejectedNonFinite,
+    rejected_tie_ms: stats.rejectedTie,
+    rejected_backwards_ms: stats.rejectedBackwards,
     elapsed_ms: Math.round(stats.elapsedMs),
-    observed_hz: round(stats.observedHz, 3),
+    // 三种频率口径同时给出，避免"这个 Hz 是什么的 Hz"这种误读。
+    window_hz_2s: round(stats.windowHz, 3),
+    session_average_hz: round(stats.sessionAverageHz, 3),
+    active_hz_excluding_gaps: round(stats.activeHz, 3),
+    active_span_ms: Math.round(stats.activeSpanMs),
     mean_interval_ms: round(stats.meanIntervalMs, 3),
     median_interval_ms: round(stats.medianIntervalMs, 3),
     p95_interval_ms: round(stats.p95IntervalMs, 3),
@@ -623,10 +895,19 @@ function summarizeStatsForExport(stats) {
     jitter_p95_ms: round(stats.jitterP95Ms, 3),
     declared_interval_mean_ms: round(stats.declaredIntervalMeanMs, 3),
     interval_cv_pct: round(stats.intervalCvPct, 3),
+    interval_sample_count: stats.intervalSampleCount,
+    interval_capacity: stats.intervalCapacity,
+    interval_stats_truncated: stats.intervalStatsTruncated,
+    interval_dropped_count: stats.intervalDroppedCount,
     gap_count: stats.gapCount,
     gap_total_ms: Math.round(stats.gapTotalMs),
     longest_gap_ms: Math.round(stats.longestGapMs),
     gaps: stats.gaps,
+    stall_threshold_ms: stats.stallMs,
+    stall_count: stats.stallCount,
+    stall_total_ms: Math.round(stats.stallTotalMs),
+    longest_stall_ms: Math.round(stats.longestStallMs),
+    stalls: stats.stalls,
   };
 }
 
@@ -681,6 +962,34 @@ function bindEvents() {
     if (state.sourceKind === "mock" && state.source) {
       state.source.setPreset(dom.selPreset.value);
     }
+  });
+
+  dom.btnCalibrate.addEventListener("click", onCalibrateClick);
+
+  dom.selWindow.addEventListener("change", () => {
+    state.windowMs = Number(dom.selWindow.value) || 5000;
+    renderWaveform(performance.now());
+  });
+
+  dom.selScale.addEventListener("change", () => {
+    state.scaleMode = dom.selScale.value === "fixed" ? "fixed" : "auto";
+    renderWaveform(performance.now());
+  });
+
+  if (dom.chips) {
+    dom.chips.addEventListener("click", (e) => {
+      const btn = e.target && e.target.closest ? e.target.closest(".chip") : null;
+      if (!btn) return;
+      const key = btn.dataset.ch;
+      if (!key || !(key in state.channels)) return;
+      state.channels[key] = !state.channels[key];
+      btn.classList.toggle("is-on", state.channels[key]);
+      renderWaveform(performance.now());
+    });
+  }
+
+  window.addEventListener("resize", () => {
+    renderWaveform(performance.now());
   });
 
   document.addEventListener("visibilitychange", () => {
@@ -757,7 +1066,13 @@ function maybeRunSmoke(params) {
     const root = document.documentElement;
     root.dataset.labSmoke = "done";
     root.dataset.labCount = String(stats.totalPushed);
-    root.dataset.labHz = stats.observedHz.toFixed(2);
+    root.dataset.labHz = stats.windowHz.toFixed(2);
+    root.dataset.labActiveHz = stats.activeHz.toFixed(2);
+    root.dataset.labAvgHz = stats.sessionAverageHz.toFixed(2);
+    root.dataset.labDeclared = stats.declaredIntervalMeanMs.toFixed(3);
+    root.dataset.labGapTotalS = (stats.gapTotalMs / 1000).toFixed(2);
+    root.dataset.labStallCount = String(stats.stallCount);
+    root.dataset.labTruncated = String(stats.intervalStatsTruncated);
     root.dataset.labGaps = String(stats.gapCount);
     root.dataset.labCsvBytes = String(csvBytes);
     root.dataset.labCsvCols = String(csvCols);
@@ -767,6 +1082,8 @@ function maybeRunSmoke(params) {
     root.dataset.labSourceState = String(state.source ? state.source.state : "none");
     root.dataset.labRunning = String(state.running);
     root.dataset.labNetworkCalls = String(state.networkCalls);
+    root.dataset.labWavePoints = String(state.wave.agmag.size);
+    root.dataset.labCalibReady = String(state.calib.ready);
   }, seconds * 1000);
 }
 
@@ -832,7 +1149,7 @@ function boot() {
   });
 
   dom.footerMeta.textContent =
-    `契约版本 ${CONTRACT_VERSION} · 应用版本 ${APP_VERSION} · 阶段 E-W1 · 不产出 17 字段样本（步频算法在 E-W3 实现）`;
+    `契约版本 ${CONTRACT_VERSION} · 应用版本 ${APP_VERSION} · 阶段 E-W2 · 不产出 17 字段样本（步频算法在 E-W3 实现）`;
 
   runEnvironmentProbe();
   buildSource("real");
@@ -848,6 +1165,9 @@ function boot() {
 
   renderLiveMetrics(refs, null);
   drawRateChart(dom.canvas, [], { devicePixelRatio: window.devicePixelRatio || 1 });
+  renderWaveform(performance.now());
+  updateCalibUi();
+  dom.btnCalibrate.disabled = true;
 
   // 供自动化冒烟检查读取的就绪标记
   document.documentElement.dataset.labBoot = "ok";

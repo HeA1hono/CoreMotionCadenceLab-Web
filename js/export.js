@@ -56,7 +56,15 @@ export const RAW_CSV_HEADER = Object.freeze([
 ]);
 
 export const DIAG_SCHEMA = "core-motion-cadence-lab/web-lab/diagnostics";
-export const DIAG_SCHEMA_VERSION = "1.0";
+export const DIAG_SCHEMA_VERSION = "1.1";
+
+/**
+ * 原始波形 CSV 的版本。
+ * 1.0：interval_ms 列实际写的是秒（E-W1 的缺陷）
+ * 1.1：interval_ms 真正是毫秒
+ * 这个版本号存在的唯一目的，是让别人拿到一个旧文件时能判断该不该信那一列。
+ */
+export const RAW_CSV_VERSION = "1.1";
 
 function pad2(n) {
   return String(n).padStart(2, "0");
@@ -148,6 +156,7 @@ export function buildDiagJson(payload) {
     appVersion,
     generatedAt,
     network,
+    calibration,
   } = payload;
 
   assertSourcePair(source, sensor);
@@ -156,8 +165,8 @@ export function buildDiagJson(payload) {
     schema: DIAG_SCHEMA,
     schema_version: DIAG_SCHEMA_VERSION,
     generated_at: new Date(generatedAt ?? Date.now()).toISOString(),
-    app_version: appVersion ?? "0.1.0",
-    phase: "E-W1",
+    app_version: appVersion ?? "0.2.0",
+    phase: "E-W2",
 
     session_id: sessionId,
     file_source: "WEB",
@@ -169,7 +178,7 @@ export function buildDiagJson(payload) {
     what_this_is: [
       "iOS Safari DeviceMotionEvent 派发的原始加速度事件流（当 source=REAL）",
       "或本地合成的测试信号（当 source=MOCK，仅供链路自测）",
-      "事件到达频率、间隔抖动与中断时段的统计",
+      "事件到达频率、间隔抖动、中断与停顿的统计",
       "采集时浏览器环境的自检结论",
     ],
     what_this_is_not: [
@@ -189,9 +198,21 @@ export function buildDiagJson(payload) {
         "步频估算算法在 E-W3 实现；本阶段不产出 17 字段样本，避免伪造 cadence 值。",
     },
 
+    raw_csv: {
+      version: RAW_CSV_VERSION,
+      column_count: RAW_CSV_HEADER.length,
+      interval_unit: "ms",
+      interval_unit_note:
+        "DeviceMotionEvent.interval 按 W3C 规范以秒给出，已在此 ×1000 转成毫秒。" +
+        "E-W1 的 1.0 版文件曾把秒直接写进 interval_ms 列，读取旧文件时需除以 1000。",
+      calibration_applied: false,
+      calibration_note: "CSV 恒为未校准的原始加速度；基线校准只影响屏幕显示。",
+    },
+
     environment: environment ?? null,
     permission: permission ?? null,
     stats: stats ?? null,
+    calibration: calibration ?? null,
     visibility_log: visibilityLog ?? [],
     network: network ?? { calls: 0, log: [], note: "未统计" },
   };
