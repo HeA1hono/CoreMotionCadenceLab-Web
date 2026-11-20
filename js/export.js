@@ -22,8 +22,17 @@ import {
   CSV_HEADER,
   WEB_SOURCE_NOTE,
   CadenceSource,
+  ContractViolation,
+  assertValid,
+  validateSequence,
   formatCsvValue,
+  sampleToCsvLine,
 } from "./contract.js";
+
+import {
+  EXPERIMENT_SCHEMA,
+  EXPERIMENT_SCHEMA_VERSION,
+} from "./experiment.js";
 
 /** 与契约 CadenceSource 对齐的两个取值 */
 export const SourceLabel = Object.freeze({
@@ -56,7 +65,32 @@ export const RAW_CSV_HEADER = Object.freeze([
 ]);
 
 export const DIAG_SCHEMA = "core-motion-cadence-lab/web-lab/diagnostics";
-export const DIAG_SCHEMA_VERSION = "1.1";
+export const DIAG_SCHEMA_VERSION = "1.3";
+
+/**
+ * 逐峰事件日志 CSV。
+ *
+ * 为什么要单独导出这一份：诊断 JSON 只放汇总，无法复核"第 137 个峰为什么被拒"。
+ * 准确率验证需要的是每一个候选峰的时间、幅值、阈值、突出度和拒绝原因。
+ */
+export const STEP_EVENTS_CSV_HEADER = Object.freeze([
+  "seq",
+  "kind",
+  "t_mono_ms",
+  "t_rel_ms",
+  "t_wall",
+  "step_index",
+  "value_ms2",
+  "threshold_ms2",
+  "prominence_ms2",
+  "interval_ms",
+  "counted",
+  "reason",
+  "source",
+  "sensor",
+]);
+
+export const STEP_EVENTS_CSV_VERSION = "1.0";
 
 /**
  * 原始波形 CSV 的版本。
@@ -142,7 +176,136 @@ export function buildRawCsv(events, meta = {}) {
 }
 
 /**
- * 生成诊断 JSON —— 环境自检、权限结果、到达频率统计、中断记录的完整快照。
+ * 生成逐峰事件 CSV（含被拒候选）。
+ *
+ * kind=step 的是被采纳的峰（counted 可能为 0/1：采纳但节奏未确认时不计数）；
+ * kind=reject 的是被四道闸门拒掉的候选，reason 写明是哪一道。
+ * 两者放在同一份文件里，"误检/漏检"才有可能被逐条复盘。
+ */
+export function buildStepEventsCsv(events, meta = {}) {
+  const { source, sensor, startWallMs } = meta;
+  assertSourcePair(source, sensor);
+
+  const list = events || [];
+  const wall0 = startWallMs ?? Date.now();
+  const t0 = list.length && Number.isFinite(list[0].t_ms) ? list[0].t_ms : 0;
+
+  const lines = [STEP_EVENTS_CSV_HEADER.join(",")];
+  list.forEach((ev, i) => {
+    const t = Number.isFinite(ev.t_ms) ? ev.t_ms : null;
+    const wall = t === null ? "" : new Date(wall0 + (t - t0)).toISOString();
+    lines.push(
+      [
+        String(i + 1),
+        ev.kind === "step" ? "step" : "reject",
+        formatCsvValue(t),
+        formatCsvValue(t === null ? null : t - t0),
+        wall,
+        formatCsvValue(ev.step_index),
+        formatCsvValue(ev.y),
+        formatCsvValue(ev.threshold),
+        formatCsvValue(ev.prominence),
+        formatCsvValue(ev.interval_ms),
+        ev.counted ? "1" : "0",
+        ev.reason ?? "",
+        source,
+        sensor,
+      ].join(",")
+    );
+  });
+  return "\ufeff" + lines.join("\r\n") + "\r\n";
+}
+
+/**
+ * 生成 17 字段契约样本 CSV（16 列，contract_version 不入 CSV）。
+ *
+ * 导出前**逐条跑契约校验**：单样本不变量 + 跨样本 INV-5。
+ * 任何一条不通过就抛错、不生成文件——宁可没有文件，也不给一份"看起来合规"的。
+ *
+ * 这些样本的 cadence 是网页算法推导值（derived），不是 CMPedometer 的
+ * currentCadence；numberOfSteps 同理。字段名沿用契约是为了可比对，
+ * 不代表数据来源相同，出处写在 note 与诊断 JSON 里。
+ */
+export function buildContractSamplesCsv(samples) {
+  const list = samples || [];
+  list.forEach((s, i) => {
+    try {
+      assertValid(s);
+    } catch (err) {
+      throw new ContractViolation(`第 ${i + 1} 条样本不合契约：${err.message}`);
+    }
+  });
+  const seqErrors = validateSequence(list);
+  if (seqErrors.length) {
+    throw new ContractViolation(`INV-5 不通过：${seqErrors.slice(0, 3).join("; ")}`);
+  }
+  const lines = [CSV_HEADER.join(",")];
+  for (const s of list) lines.push(sampleToCsvLine(s));
+  return "\ufeff" + lines.join("\r\n") + "\r\n";
+}
+
+/**
+ * 实验记录 JSON —— 每一轮的人工真值、算法预测、误差、条件与参数版本。
+ */
+export function buildExperimentJson(payload) {
+  const {
+    rounds,
+    summary,
+    params,
+    sessionId,
+    source,
+    sensor,
+    generatedAt,
+    appVersion,
+    environment,
+    calibration,
+  } = payload;
+
+  assertSourcePair(source, sensor);
+
+  return {
+    schema: EXPERIMENT_SCHEMA,
+    schema_version: EXPERIMENT_SCHEMA_VERSION,
+    generated_at: new Date(generatedAt ?? Date.now()).toISOString(),
+    app_version: appVersion ?? "0.3.0",
+    phase: "E-W3",
+
+    session_id: sessionId,
+    // 回合可能跨越多次采集（每次采集换 session_id），所以另外给出全集，
+    // 免得读者以为所有回合都属于 session_id 这一条。
+    session_ids: payload.sessionIds ?? (sessionId ? [sessionId] : []),
+    file_source: "WEB",
+    source,
+    sensor,
+    is_synthetic: source === SourceLabel.MOCK,
+    note: WEB_SOURCE_NOTE,
+
+    ground_truth_vs_prediction: {
+      manual_steps: "人工计数，作为真值（ground truth）",
+      algorithm_steps: "网页算法检测，作为预测（prediction）",
+      error_steps: "algorithm_steps − manual_steps，正数=多计，负数=少计",
+      abs_error_pct: "|error| ÷ manual_steps × 100，分母是真值",
+      caveat: "净误差不能分离误检与漏检；净误差为 0 也可能二者相互抵消",
+    },
+
+    params: params ?? null,
+    summary: summary ?? null,
+    rounds: rounds ?? [],
+    environment: environment ?? null,
+    calibration: calibration ?? null,
+    what_this_is_not: [
+      "不是 CMPedometer 输出",
+      "不是逐拍标注的真值数据集：人工计数只提供总数",
+      "不包含任何上传痕迹：全部在浏览器内生成，导出即本地下载",
+    ],
+  };
+}
+/**
+ * 生成诊断 JSON —— 环境自检、权限结果、频率统计、中断记录、E-W3 步态摘要。
+ *
+ * E-W3 起 `sample_output_pending` 变为 false，并且 what_this_is_not 必须写明
+ * "步数是网页算法推导值"。这句话不是免责声明，是防止有人把这份文件当成
+ * CMPedometer 的导出去做二次分析。
  */
 export function buildDiagJson(payload) {
   const {
@@ -157,6 +320,8 @@ export function buildDiagJson(payload) {
     generatedAt,
     network,
     calibration,
+    ew3,
+    contractSamples,
   } = payload;
 
   assertSourcePair(source, sensor);
@@ -165,8 +330,8 @@ export function buildDiagJson(payload) {
     schema: DIAG_SCHEMA,
     schema_version: DIAG_SCHEMA_VERSION,
     generated_at: new Date(generatedAt ?? Date.now()).toISOString(),
-    app_version: appVersion ?? "0.2.0",
-    phase: "E-W2",
+    app_version: appVersion ?? "0.3.0",
+    phase: "E-W3",
 
     session_id: sessionId,
     file_source: "WEB",
@@ -179,12 +344,13 @@ export function buildDiagJson(payload) {
       "iOS Safari DeviceMotionEvent 派发的原始加速度事件流（当 source=REAL）",
       "或本地合成的测试信号（当 source=MOCK，仅供链路自测）",
       "事件到达频率、间隔抖动、中断与停顿的统计",
+      "基于上述加速度、在浏览器内推导的步数与步频（derived，非系统计步器）",
       "采集时浏览器环境的自检结论",
     ],
     what_this_is_not: [
       "不是 Core Motion（CMPedometer）的输出",
-      "不含 numberOfSteps / currentCadence / distance / pace",
-      "不含 17 字段契约样本：步频算法尚未实现（计划 E-W3）",
+      "不含 numberOfSteps / currentCadence 的系统原值：本页步数由算法推导",
+      "不含逐拍人工标注：人工计数只提供每轮总步数",
       "不含任何上传到第三方的痕迹：全部数据只在页面内生成，导出即下载",
     ],
 
@@ -193,9 +359,12 @@ export function buildDiagJson(payload) {
       source_enum: [CadenceSource.REAL, CadenceSource.MOCK],
       sample_field_count: SAMPLE_FIELDS.length,
       csv_column_count: CSV_HEADER.length,
-      sample_output_pending: true,
-      pending_reason:
-        "步频估算算法在 E-W3 实现；本阶段不产出 17 字段样本，避免伪造 cadence 值。",
+      sample_output_pending: false,
+      sample_source: "derived_from_devicemotion",
+      sample_note:
+        "17 字段样本已产出，cadence 为网页算法推导值（derived）；" +
+        "字段名沿用以便比对，不代表与 CMPedometer 同源。",
+      sample_count: Array.isArray(contractSamples) ? contractSamples.length : 0,
     },
 
     raw_csv: {
@@ -209,6 +378,14 @@ export function buildDiagJson(payload) {
       calibration_note: "CSV 恒为未校准的原始加速度；基线校准只影响屏幕显示。",
     },
 
+    step_events_csv: {
+      version: STEP_EVENTS_CSV_VERSION,
+      column_count: STEP_EVENTS_CSV_HEADER.length,
+      note: "kind=step 为采纳峰，kind=reject 为被拒候选；reason 写明拒绝闸门。",
+    },
+
+    ew3: ew3 ?? null,
+
     environment: environment ?? null,
     permission: permission ?? null,
     stats: stats ?? null,
@@ -219,6 +396,19 @@ export function buildDiagJson(payload) {
 }
 
 /**
+ * 导出类型 → 文件名前缀与扩展名。
+ * 未知类型直接抛错，不退回默认值——"猜一个"正是误标最容易发生的地方。
+ */
+export const FILE_KINDS = Object.freeze({
+  raw: { prefix: "raw", ext: "csv" },
+  diag: { prefix: "diag", ext: "json" },
+  steps: { prefix: "steps", ext: "csv" },
+  exp: { prefix: "exp", ext: "json" },
+  expcsv: { prefix: "exp", ext: "csv" },
+  samples: { prefix: "samples", ext: "csv" },
+});
+
+/**
  * 文件名拼装：`<kind>_<stamp>_WEB_<REAL|MOCK>.<ext>`
  * 把 REAL / MOCK 写进文件名，是为了让文件在文件管理器里就能一眼分辨，
  * 不需要打开看内容。
@@ -227,9 +417,11 @@ export function buildFilename(kind, stamp, source) {
   if (source !== SourceLabel.REAL && source !== SourceLabel.MOCK) {
     throw new Error(`buildFilename 需要 source=REAL|MOCK，收到 ${JSON.stringify(source)}`);
   }
-  const safeKind = kind === "raw" ? "raw" : "diag";
-  const ext = kind === "raw" ? "csv" : "json";
-  return `${safeKind}_${stamp}_WEB_${source}.${ext}`;
+  const spec = FILE_KINDS[kind];
+  if (!spec) {
+    throw new Error(`未知的导出类型: ${JSON.stringify(kind)}`);
+  }
+  return `${spec.prefix}_${stamp}_WEB_${source}.${spec.ext}`;
 }
 
 /** 触发浏览器下载。 */

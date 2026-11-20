@@ -19,9 +19,19 @@ import {
 } from "./waveform.js";
 import { CalibrationModel } from "./calibration.js";
 import {
+  StepDetector,
+  STEP_PARAMS,
+  MotionState,
+} from "./stepdetect.js";
+import { drawStepChart } from "./stepchart.js";
+import { ExperimentLog, ExperimentError } from "./experiment.js";
+import {
   renderEnvList,
   renderLiveMetrics,
   renderGaps,
+  renderMotionLog,
+  renderRejectTable,
+  renderExperimentTable,
   drawRateChart,
   setBadge,
   setVerdict,
@@ -30,6 +40,9 @@ import {
 import {
   buildRawCsv,
   buildDiagJson,
+  buildStepEventsCsv,
+  buildContractSamplesCsv,
+  buildExperimentJson,
   buildFilename,
   formatStamp,
   downloadText,
@@ -37,9 +50,18 @@ import {
   SourceLabel,
   SensorKind,
 } from "./export.js";
-import { makeWebSessionId, CONTRACT_VERSION } from "./contract.js";
+import { buildExperimentCsv } from "./experiment.js";
+import {
+  makeWebSessionId,
+  makeSample,
+  assertValid,
+  CONTRACT_VERSION,
+  CadenceStatus,
+  SampleQuality,
+  CadenceRawUnit,
+} from "./contract.js";
 
-const APP_VERSION = "0.2.0";
+const APP_VERSION = "0.3.0";
 const UPDATE_INTERVAL_MS = 200;
 /** 本机开发服务器端点。仅在 localhost 下才会被使用，见 isLocalDevHost()。 */
 const DEV_SAVE_ENDPOINT = "/api/save";
@@ -112,6 +134,55 @@ const dom = {
   netCounter: el("net-counter"),
   exportState: el("export-state"),
   footerMeta: el("footer-meta"),
+  btnExportSteps: el("btn-export-steps"),
+  btnExportSamples: el("btn-export-samples"),
+
+  // ⑦ 步数与步频
+  stepState: el("step-state"),
+  mSteps: el("m-steps"),
+  mSpm: el("m-spm"),
+  mSpm5: el("m-spm5"),
+  mSpm10: el("m-spm10"),
+  mSpm30: el("m-spm30"),
+  mConf: el("m-conf"),
+  mQuality: el("m-quality"),
+  mCoverage: el("m-coverage"),
+  mLastStep: el("m-last-step"),
+  motionList: el("motion-list"),
+  stepNote: el("step-note"),
+  stepModeNote: el("step-mode-note"),
+
+  // ⑧ 检测可视化
+  plotState: el("plot-state"),
+  waveSteps: el("wave-steps"),
+  selStepWindow: el("sel-step-window"),
+  selStepScale: el("sel-step-scale"),
+  stepChips: el("step-chips"),
+  mCand: el("m-cand"),
+  mAccepted: el("m-accepted"),
+  mCounted: el("m-counted"),
+  stepFunnel: el("step-funnel"),
+  mThreshold: el("m-threshold"),
+  rejectBody: el("reject-body"),
+
+  // ⑨ 人工对照
+  expState: el("exp-state"),
+  selMotionType: el("sel-motion-type"),
+  selPosture: el("sel-posture"),
+  inpTargetSpm: el("inp-target-spm"),
+  inpManual: el("inp-manual"),
+  btnExpStart: el("btn-exp-start"),
+  btnExpEnd: el("btn-exp-end"),
+  btnExpSave: el("btn-exp-save"),
+  btnExpCancel: el("btn-exp-cancel"),
+  expResult: el("exp-result"),
+  mRoundSteps: el("m-round-steps"),
+  mRoundDur: el("m-round-dur"),
+  mRoundSpm: el("m-round-spm"),
+  expBody: el("exp-body"),
+  expSummary: el("exp-summary"),
+  btnExportExp: el("btn-export-exp"),
+  btnExportExpCsv: el("btn-export-exp-csv"),
 };
 
 const state = {
@@ -143,6 +214,34 @@ const state = {
   windowMs: 5000,
   scaleMode: "auto",
   calib: new CalibrationModel({ samplesNeeded: 90 }),
+
+  // E-W3：步态检测。source 只用于标记，算法本身不区分 REAL / MOCK。
+  step: new StepDetector({ source: "REAL" }),
+  stepSnapshot: null,
+  stepChannels: {
+    raw: true,
+    filtered: true,
+    threshold: true,
+    steps: true,
+    rejected: true,
+  },
+  stepWindowMs: 5000,
+  stepScaleMode: "auto",
+  lastStepDrawMs: 0,
+
+  // E-W3：契约样本（每秒一条，导出前逐条校验）
+  contractSamples: [],
+  lastSampleAtMs: null,
+  contractError: null,
+
+  // E-W3：人工对照实验
+  experiment: new ExperimentLog({
+    sessionId: null,
+    source: "REAL",
+    sensor: "devicemotion",
+    paramsVersion: STEP_PARAMS.version,
+  }),
+  expRound: null,
 };
 
 /**
@@ -288,6 +387,9 @@ function buildSource(kind) {
   }
 
   state.sourceKind = kind;
+  // 检测器只带来源标记，算法不因 REAL / MOCK 改变任何参数——
+  // 若参数随来源变化，"MOCK 通过"就不能代表"REAL 会通过"。
+  state.step.source = kind === "mock" ? "MOCK" : "REAL";
   dom.fieldPreset.hidden = kind !== "mock";
   dom.ribbon.hidden = kind !== "mock";
   setBadge(
@@ -329,6 +431,9 @@ function handleEvent(record) {
   if (!accepted) return;
   state.lastEvent = record;
   pushWave(record);
+  // 步态检测只吃被 monitor 接受的事件：时间戳重复的样本一旦进入算法，
+  // 重采样会把两个样本插到同一网格点上，等于凭空多一段数据。
+  state.step.push(record);
 
   if (state.calib.capturing) {
     state.calib.addSample({ x: record.agx, y: record.agy, z: record.agz });
@@ -413,7 +518,370 @@ function renderWaveform(nowMs) {
   drawWaveform(dom.waveMags, { series: magSeries, tRange, yRange: magsY, dpr });
 }
 
-// ---------------------------------------------------------------- 校准
+// ---------------------------------------------------------------- 步态（E-W3）
+
+/** 步频文本：估计值未满 4 步时加 ≈，提示"这是暂定值，还会变"。 */
+function spmText(value, provisional) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
+  return provisional ? `≈${Math.round(value)}` : String(Math.round(value));
+}
+
+/**
+ * 距最近一步过了多久（秒，保留一位小数）。
+ *
+ * 只返回数字，单位放在旁边的 <span class="u">秒前</span> 里：
+ * 390px 宽时四个指标并排，每列只有约 76px，
+ * "655 ms 前"这种整串会被 text-overflow 截成"655 ms …"，读起来像坏数据。
+ */
+function relativeText(nowMs, tMs) {
+  if (tMs === null || tMs === undefined || !Number.isFinite(tMs)) return "—";
+  const dt = Math.max(0, nowMs - tMs);
+  return (dt / 1000).toFixed(1);
+}
+
+function renderStepUi(snap, nowMs, stats) {
+  if (!snap) {
+    dom.mSteps.textContent = "0";
+    dom.mSpm.textContent = "—";
+    dom.mSpm5.textContent = "—";
+    dom.mSpm10.textContent = "—";
+    dom.mSpm30.textContent = "—";
+    dom.mConf.textContent = "—";
+    dom.mQuality.textContent = "—";
+    dom.mCoverage.textContent = "—";
+    dom.mLastStep.textContent = "—";
+    dom.mCand.textContent = "0";
+    dom.mAccepted.textContent = "0";
+    dom.mCounted.textContent = "0";
+    dom.mThreshold.textContent = "—";
+    if (dom.stepFunnel) {
+      dom.stepFunnel.textContent = "判定漏斗：候选 = 通过闸门 + 闸门拒绝 + 被取代 + 待决。尚未开始。";
+    }
+    dom.motionList.textContent = "";
+    renderMotionLog(dom.motionList, [], null);
+    renderRejectTable(dom.rejectBody, null, 0);
+    if (dom.stepModeNote) dom.stepModeNote.hidden = true;
+    return;
+  }
+
+  dom.mSteps.textContent = String(snap.steps);
+  dom.mSpm.textContent = spmText(snap.cadenceSpm, snap.cadenceProvisional);
+  dom.mSpm5.textContent = spmText(snap.cadenceWindow5Spm, snap.cadenceWindow5Provisional);
+  dom.mSpm10.textContent = spmText(snap.cadenceWindow10Spm, snap.cadenceWindow10Provisional);
+  dom.mSpm30.textContent = spmText(snap.cadenceWindow30Spm, snap.cadenceWindow30Provisional);
+
+  // 置信度只在"检测到运动"时才有意义。静止时报 0% 会让人以为算法坏了，
+  // 实际是"没有东西可置信"——两种含义必须区分。
+  dom.mConf.textContent =
+    snap.state === MotionState.STILL ? "—" : String(snap.confidence);
+  dom.mQuality.textContent = snap.qualityLabel;
+  dom.mCoverage.textContent = snap.coveragePct === null ? "—" : String(Math.round(snap.coveragePct));
+  dom.mLastStep.textContent = relativeText(nowMs, snap.lastStepMs);
+
+  dom.mCand.textContent = String(snap.candidateCount);
+  dom.mAccepted.textContent = String(snap.acceptedCount);
+  dom.mCounted.textContent = String(snap.steps);
+  dom.mThreshold.textContent = snap.threshold === null ? "—" : snap.threshold.toFixed(2);
+
+  // 漏斗必须能对上账：候选 = 通过闸门 + 闸门拒绝 + 被取代 + 待决。
+  // 对不上就说明有候选凭空消失了——那比步数错更严重，必须写在界面上。
+  if (dom.stepFunnel) {
+    const sum =
+      snap.acceptedCount + snap.gateRejectedCount + snap.supersededCount + snap.pendingHoldCount;
+    const balanced = sum === snap.candidateCount;
+    dom.stepFunnel.textContent =
+      `判定漏斗：候选 ${snap.candidateCount} = 通过闸门 ${snap.acceptedCount}` +
+      ` + 拒绝 ${snap.gateRejectedCount} + 被取代 ${snap.supersededCount} + 待决 ${snap.pendingHoldCount}` +
+      `（${balanced ? "已配平" : "不配平，检查算法"}）；` +
+      `拒绝合计 ${snap.rejectedCount}（含节奏 ${snap.rejected.rhythm}、` +
+      `重复时间戳 ${snap.rejected["duplicate-time"]}、非法值 ${snap.rejected.invalid}）；` +
+      `回溯撤销否决 ${snap.reversedRejectCount} 次。`;
+    dom.stepFunnel.className = balanced ? "note note-tight" : "note note-tight note-fail";
+  }
+
+  const levelClass =
+    snap.state === MotionState.MOVING
+      ? "is-ok"
+      : snap.state === MotionState.UNSTABLE
+        ? "is-warn"
+        : snap.state === MotionState.INTERRUPTED
+          ? "is-fail"
+          : "";
+  setVerdict(dom.stepState, snap.stateLabel, levelClass);
+
+  if (snap.state === MotionState.INTERRUPTED) {
+    setVerdict(dom.plotState, "传感器中断", "is-fail");
+  } else if (snap.state === MotionState.MOVING) {
+    setVerdict(dom.plotState, "节奏已确认", "is-ok");
+  } else if (snap.state === MotionState.UNSTABLE) {
+    setVerdict(dom.plotState, "节奏未确认", "is-warn");
+  } else {
+    setVerdict(dom.plotState, "静止", "");
+  }
+
+  renderMotionLog(dom.motionList, snap.motionEvents, stats && stats.firstMs);
+  renderRejectTable(dom.rejectBody, snap.rejected, snap.reversedRejectCount);
+
+  // 信号回退必须写在界面上：用错通道时的步数看起来同样"正常"。
+  if (dom.stepModeNote) {
+    if (snap.mode !== "gravity-mag" || snap.modeReason) {
+      dom.stepModeNote.hidden = false;
+      dom.stepModeNote.className = "note note-warn";
+      dom.stepModeNote.textContent =
+        `当前信号通道：${snap.mode}` +
+        (snap.modeReason ? `（原因：${snap.modeReason}）` : "") +
+        "。默认使用含重力模长；回退到线性模长时，低频步态可能倍计，请复核步数。";
+    } else {
+      dom.stepModeNote.hidden = true;
+    }
+  }
+}
+
+/** 窗口步频的分辨率提示：5 秒窗一步 = 12 SPM，不能读小数。 */
+function renderStepChart(nowMs) {
+  if (!dom.waveSteps) return;
+  const to = waveAnchor(nowMs);
+  const from = to - state.stepWindowMs;
+  const cols = plotColumns(dom.waveSteps);
+  const snap = state.stepSnapshot;
+
+  drawStepChart(dom.waveSteps, {
+    rawCols: state.step.rawSeries(from, to, cols),
+    filtCols: state.step.filteredSeries(from, to, cols),
+    tRange: { from, to },
+    yRange: state.stepScaleMode === "fixed" ? { min: 0, max: 20 } : undefined,
+    threshold: snap ? snap.threshold : null,
+    steps: state.step.peaksIn(from, to),
+    rejected: state.step.rejectedIn(from, to),
+    show: state.stepChannels,
+    dpr: window.devicePixelRatio || 1,
+  });
+}
+
+/**
+ * 每秒写一条 17 字段契约样本。
+ *
+ * 样本不是"照着契约编出来的"：每一步都用 makeSample 构造后立刻 assertValid，
+ * 不通过就丢弃并记下原因，绝不把一条不合契约的记录混进导出文件。
+ */
+function maybeRecordContractSample(nowMs, snap) {
+  if (!state.running) return;
+  if (state.lastSampleAtMs !== null && nowMs - state.lastSampleAtMs < 1000) return;
+  state.lastSampleAtMs = nowMs;
+
+  const interrupted = snap.state === MotionState.INTERRUPTED;
+  const status = interrupted ? CadenceStatus.INTERRUPTED : CadenceStatus.OK;
+  const cadence = interrupted ? null : Math.round(snap.cadenceSpm ?? 0);
+  const quality = interrupted
+    ? SampleQuality.GAP
+    : (snap.sinceEventMs ?? 0) > 500
+      ? SampleQuality.STALE
+      : SampleQuality.OK;
+
+  const prev = state.contractSamples[state.contractSamples.length - 1] || null;
+  const total = snap.steps;
+  const sample = makeSample({
+    seq: state.contractSamples.length + 1,
+    session_id: state.sessionId,
+    source: currentSourcePair().source,
+    status,
+    t_mono_ns: Math.round(nowMs * 1e6),
+    t_wall: new Date().toISOString(),
+    steps_total: total,
+    // 首条样本没有前一条：delta 取当时累计值，gap 必须为 0（INV-11）
+    steps_delta: prev ? total - prev.steps_total : total,
+    cadence_spm: cadence,
+    cadence_raw: cadence === null ? null : cadence / 60,
+    cadence_raw_unit: CadenceRawUnit.STEPS_PER_SECOND,
+    gap_ms: prev ? Math.round(nowMs - prev.t_mono_ns / 1e6) : 0,
+    data_age_ms: Math.round(snap.sinceEventMs ?? 0),
+    quality,
+    // REAL 模式不得带目标步频（INV-8）；MOCK 才有预设目标
+    target_spm:
+      state.sourceKind === "mock" ? SAMPLE_TARGET_SPM[dom.selPreset.value] ?? null : null,
+    note: "derived=web-stepdetect;not_cmpedometer",
+  });
+
+  try {
+    assertValid(sample);
+    state.contractSamples.push(sample);
+    state.contractError = null;
+  } catch (err) {
+    state.contractError = String((err && err.message) || err).slice(0, 200);
+    if (dom.stepNote) {
+      dom.stepNote.textContent = `契约样本未通过校验，已跳过：${state.contractError}`;
+      dom.stepNote.className = "note note-warn";
+    }
+  }
+  // 4 小时 @1Hz，防长会话无限增长
+  if (state.contractSamples.length > 14400) state.contractSamples.shift();
+}
+
+const SAMPLE_TARGET_SPM = Object.freeze({
+  walk: 120,
+  jog: 170,
+  handheld: 0,
+  still: 0,
+});
+
+// ---------------------------------------------------------------- 实验回合
+
+function experimentMeta() {
+  const target = Number.parseInt(dom.inpTargetSpm.value, 10);
+  return {
+    sessionId: state.sessionId,
+    source: currentSourcePair().source,
+    sensor: currentSourcePair().sensor,
+    paramsVersion: STEP_PARAMS.version,
+    motionType: dom.selMotionType.value,
+    posture: dom.selPosture.value,
+    targetSpm: Number.isFinite(target) ? target : null,
+    wallIso: new Date().toISOString(),
+  };
+}
+
+function onExpStart() {
+  if (!state.running) {
+    dom.expResult.textContent = "必须先在 ② 开始采集，才能开始一轮实验。";
+    return;
+  }
+  state.experiment.begin(performance.now(), experimentMeta());
+  state.expRound = null;
+  dom.btnExpStart.disabled = true;
+  dom.btnExpEnd.disabled = false;
+  dom.btnExpSave.disabled = true;
+  dom.btnExpCancel.disabled = false;
+  dom.inpManual.value = "";
+  setVerdict(dom.expState, "计时中", "is-warn");
+  dom.expResult.textContent =
+    `回合 ${state.experiment.openRound.round_id} 已开始。现在开始走，走完先点「结束本轮」，再填人工计数。`;
+}
+
+function endExperimentRound(silent = false) {
+  if (!state.experiment.isOpen) return;
+  const now = performance.now();
+  const startMs = state.experiment.openRound.started_at_ms;
+  const snap = state.stepSnapshot || state.step.snapshot(now);
+  // 只统计"本轮时间段内已计数"的步：用事件时间而不是总数差，
+  // 这样回合结束后算法的回溯补计不会溜进本轮。
+  const algorithmSteps = state.step.stepsBetween(startMs, now);
+  const round = state.experiment.end(now, {
+    algorithmSteps,
+    diagnostics: {
+      confidence: snap.confidence,
+      coveragePct: snap.coveragePct,
+      gapCount: snap.gapCount,
+      state: snap.state,
+      quality: snap.quality,
+      mode: snap.mode,
+    },
+  });
+  state.expRound = round;
+
+  dom.btnExpEnd.disabled = true;
+  dom.btnExpSave.disabled = false;
+  dom.btnExpCancel.disabled = true;
+  dom.btnExpStart.disabled = true;
+  dom.btnExpSave.focus();
+  setVerdict(dom.expState, "待填人工数", "is-warn");
+  if (!silent) {
+    dom.expResult.textContent =
+      `回合 ${round.round_id} 结束：时长 ${(round.duration_ms / 1000).toFixed(1)} s，` +
+      `算法本次计 ${round.algorithm_steps} 步（已冻结）。请填写人工实际步数后保存。`;
+  }
+}
+
+function onExpSave() {
+  if (!state.experiment.openRound || !state.experiment.openRound.ended_at_ms) {
+    dom.expResult.textContent = "请先结束本轮。";
+    return;
+  }
+  const raw = String(dom.inpManual.value || "").trim();
+  const manual = Number.parseInt(raw, 10);
+  if (!raw || !Number.isInteger(manual) || manual < 0) {
+    dom.expResult.textContent = "人工计数必须是 >= 0 的整数。空着不算 0。";
+    return;
+  }
+  try {
+    const round = state.experiment.commitManual(manual);
+    dom.expResult.textContent =
+      `已保存 ${round.round_id}：人工 ${round.manual_steps} 步，算法 ${round.algorithm_steps} 步，` +
+      `误差 ${round.error_steps > 0 ? "+" : ""}${round.error_steps} 步` +
+      (round.abs_error_pct === null ? "（真值为 0，百分比无定义）" : `（${round.abs_error_pct}%）`);
+    dom.btnExpSave.disabled = true;
+    dom.btnExpStart.disabled = !state.running;
+    dom.btnExpCancel.disabled = true;
+    dom.inpManual.value = "";
+    setVerdict(dom.expState, "已保存", "is-ok");
+    state.expRound = null;
+    renderExperimentUi();
+  } catch (err) {
+    dom.expResult.textContent =
+      err instanceof ExperimentError ? err.message : `保存失败：${String(err)}`;
+  }
+}
+
+function onExpCancel() {
+  state.experiment.cancel();
+  state.expRound = null;
+  dom.btnExpStart.disabled = !state.running;
+  dom.btnExpEnd.disabled = true;
+  dom.btnExpSave.disabled = true;
+  dom.btnExpCancel.disabled = true;
+  dom.inpManual.value = "";
+  setVerdict(dom.expState, state.running ? "未开始" : "已停止", "");
+  dom.expResult.textContent = "已放弃本轮，没有产生记录。";
+}
+
+function renderRoundLive(nowMs, snap) {
+  const open = state.experiment.openRound;
+  if (!open) {
+    if (state.expRound && state.expRound.ended_at_ms) {
+      dom.mRoundSteps.textContent = String(state.expRound.algorithm_steps);
+      dom.mRoundDur.textContent = (state.expRound.duration_ms / 1000).toFixed(1);
+      dom.mRoundSpm.textContent = "—";
+    } else {
+      dom.mRoundSteps.textContent = "—";
+      dom.mRoundDur.textContent = "—";
+      dom.mRoundSpm.textContent = "—";
+    }
+    return;
+  }
+  const endMs = open.ended_at_ms ?? nowMs;
+  dom.mRoundSteps.textContent = String(state.step.stepsBetween(open.started_at_ms, endMs));
+  dom.mRoundDur.textContent = ((endMs - open.started_at_ms) / 1000).toFixed(1);
+  dom.mRoundSpm.textContent = spmText(snap.cadenceSpm, snap.cadenceProvisional);
+}
+
+function renderExperimentUi() {
+  renderExperimentTable(dom.expBody, state.experiment.rounds);
+  const summary = state.experiment.summary();
+  if (!summary.rounds) {
+    dom.expSummary.textContent = "尚无已提交的回合。";
+  } else {
+    dom.expSummary.textContent =
+      `共 ${summary.rounds} 轮：人工合计 ${summary.manual_steps_total} 步，` +
+      `算法合计 ${summary.algorithm_steps_total} 步，绝对误差合计 ${summary.abs_error_total} 步；` +
+      `平均绝对误差 ${summary.mean_abs_error_pct === null ? "—" : summary.mean_abs_error_pct + "%"}，` +
+      `最大 ${summary.max_abs_error_pct === null ? "—" : summary.max_abs_error_pct + "%"}；` +
+      `多计 ${summary.over_count} 轮 / 少计 ${summary.under_count} 轮 / 完全一致 ${summary.exact_count} 轮。` +
+      `注意：这是净误差，不能分离误检与漏检。`;
+  }
+  const has = state.experiment.rounds.length > 0;
+  dom.btnExportExp.disabled = !has;
+  dom.btnExportExpCsv.disabled = !has;
+  // 徽章要说清"现在能不能开一轮"，而不是只写"未开始"：
+  // 采集中却写"未开始"，用户会以为按钮点不动是坏了。
+  const n = state.experiment.rounds.length;
+  if (state.experiment.isOpen) {
+    setVerdict(dom.expState, "计时中", "is-warn");
+  } else if (state.running) {
+    setVerdict(dom.expState, n ? `可再开一轮 · 已存 ${n}` : "可开始一轮", "is-ok");
+  } else {
+    setVerdict(dom.expState, n ? `已存 ${n} 轮 · 采集已停` : "采集未开始", "");
+  }
+  renderRoundLive(performance.now(), state.stepSnapshot || { cadenceSpm: null });
+}
 
 function updateCalibUi() {
   if (!dom.calibState) return;
@@ -544,6 +1012,17 @@ async function onStartClick() {
   if (state.calib.capturing) state.calib.cancel();
   updateCalibUi();
 
+  // E-W3：新采集 = 新会话。检测器、契约样本、未完成的实验回合全部重来；
+  // 已保存的回合保留（每轮自带 session_id，导出时不会串会话）。
+  state.step.reset();
+  state.step.source = state.sourceKind === "mock" ? "MOCK" : "REAL";
+  state.stepSnapshot = null;
+  state.contractSamples = [];
+  state.lastSampleAtMs = null;
+  state.contractError = null;
+  state.expRound = null;
+  state.experiment.cancel();
+
   // 每次开新会话都换 session_id，避免跨会话数据混在一起
   state.sessionId = makeWebSessionId();
 
@@ -568,7 +1047,10 @@ async function onStartClick() {
   dom.btnReset.disabled = false;
   dom.btnExportCsv.disabled = true;
   dom.btnExportJson.disabled = true;
+  dom.btnExportSteps.disabled = true;
+  dom.btnExportSamples.disabled = true;
   dom.btnCalibrate.disabled = false;
+  dom.btnExpStart.disabled = false;
   dom.exportResult.textContent = "";
   setVerdict(dom.liveState, "采集中", "is-ok");
   setVerdict(dom.rateState, "等待事件…", "");
@@ -588,6 +1070,18 @@ function onStopClick() {
   state.monitor.finalize(now);
   stopUpdateLoop();
   refreshStats(now, true);
+
+  // 停止时若有未结束的实验回合，按停止时刻自动收尾。
+  // 留着一个"永远在计时"的回合，下次开始采集会被静默丢弃——那才是真的丢数据。
+  if (state.experiment.isOpen) {
+    endExperimentRound(true);
+  }
+  dom.btnExpStart.disabled = true;
+  dom.btnExportSteps.disabled = state.step.eventLog().length === 0;
+  dom.btnExportSamples.disabled = state.contractSamples.length === 0;
+  // 停止后必须重画 ⑨ 的状态：否则徽章还停在"未开始"，
+  // 而按钮已经因为 !running 变灰，用户看到的是"点了没反应"。
+  renderExperimentUi();
 
   dom.btnStop.disabled = true;
   dom.btnReset.disabled = false;
@@ -616,6 +1110,16 @@ function onResetClick() {
   state.startedWallMs = null;
   state.visibilityLog = [];
   clearWave();
+
+  // E-W3 状态一并清空。注意：已保存的实验回合不清——那是用户已经确认过的记录。
+  state.step.reset();
+  state.stepSnapshot = null;
+  state.contractSamples = [];
+  state.lastSampleAtMs = null;
+  state.contractError = null;
+  state.expRound = null;
+  state.experiment.cancel();
+
   renderLiveMetrics(refs, null);
   setMetricText(EMPTY_METRICS);
   dom.gapBody.textContent = "";
@@ -624,13 +1128,25 @@ function onResetClick() {
   if (dom.rejectNote) dom.rejectNote.hidden = true;
   drawRateChart(dom.canvas, [], { devicePixelRatio: window.devicePixelRatio || 1 });
   renderWaveform(performance.now());
+  renderStepUi(null);
+  renderStepChart(performance.now());
+  renderExperimentUi();
   dom.btnExportCsv.disabled = true;
   dom.btnExportJson.disabled = true;
+  dom.btnExportSteps.disabled = true;
+  dom.btnExportSamples.disabled = true;
   dom.btnCalibrate.disabled = true;
+  dom.btnExpStart.disabled = true;
+  dom.btnExpEnd.disabled = true;
+  dom.btnExpSave.disabled = true;
+  dom.btnExpCancel.disabled = true;
   dom.exportResult.textContent = "";
   setVerdict(dom.liveState, "空闲", "");
   setVerdict(dom.rateState, "空闲", "");
   setVerdict(dom.waveState, "空闲", "");
+  setVerdict(dom.stepState, "静止", "");
+  setVerdict(dom.plotState, "空闲", "");
+  setVerdict(dom.expState, "未开始", "");
 }
 
 function startUpdateLoop() {
@@ -760,6 +1276,17 @@ function refreshStats(nowMs, force) {
     state.lastWaveDrawMs = now;
     renderWaveform(now);
   }
+
+  // E-W3：步态指标每帧都算（代价很低），图形 10fps 足够。
+  const stepSnap = state.step.snapshot(now);
+  state.stepSnapshot = stepSnap;
+  renderStepUi(stepSnap, now, stats);
+  if (force || now - (state.lastStepDrawMs || 0) > 100) {
+    state.lastStepDrawMs = now;
+    renderStepChart(now);
+  }
+  maybeRecordContractSample(now, stepSnap);
+  if (state.experiment.isOpen) renderRoundLive(now, stepSnap);
 }
 
 // ---------------------------------------------------------------- 导出
@@ -832,6 +1359,20 @@ async function onExportJson() {
       visibilityLog: meta.visibilityLog,
       appVersion: APP_VERSION,
       generatedAt: meta.generatedAt,
+      contractSamples: state.contractSamples,
+      ew3: {
+        params: STEP_PARAMS,
+        summary: summarizeStepForExport(
+          state.stepSnapshot || state.step.snapshot(performance.now())
+        ),
+        // 自检：步数与逐峰事件日志必须一致，否则导出的步数不可信
+        self_check: state.step.selfCheck(),
+        step_events_count: state.step.eventLog().length,
+        contract_samples: {
+          count: state.contractSamples.length,
+          error: state.contractError,
+        },
+      },
       network: {
         calls: state.networkCalls,
         log: state.networkLog.slice(),
@@ -917,6 +1458,128 @@ function round(v, digits) {
   return Math.round(v * f) / f;
 }
 
+function summarizeStepForExport(snap) {
+  if (!snap) return null;
+  return {
+    params_version: snap.paramsVersion,
+    signal_mode: snap.mode,
+    signal_mode_reason: snap.modeReason,
+    steps_total: snap.steps,
+    cadence_spm_derived: snap.cadenceSpm,
+    cadence_spm_5s: snap.cadenceWindow5Spm,
+    cadence_spm_10s: snap.cadenceWindow10Spm,
+    cadence_spm_30s: snap.cadenceWindow30Spm,
+    cadence_provisional_5s: snap.cadenceWindow5Provisional,
+    cadence_provisional_10s: snap.cadenceWindow10Provisional,
+    cadence_provisional_30s: snap.cadenceWindow30Provisional,
+    state: snap.state,
+    state_label: snap.stateLabel,
+    gate_open: snap.gateOpen,
+    periodicity: snap.periodicity,
+    confidence: snap.confidence,
+    confidence_level: snap.confidenceLevel,
+    quality: snap.quality,
+    coverage_pct: snap.coveragePct,
+    expected_hz: snap.expectedHz,
+    threshold_ms2: snap.threshold,
+    p95_abs_ms2: snap.p95Abs,
+    interval_median_ms: snap.intervalMedianMs,
+    interval_cv_pct: snap.intervalCvPct,
+    candidate_count: snap.candidateCount,
+    accepted_count: snap.acceptedCount,
+    rejected_count: snap.rejectedCount,
+    rejected_breakdown: snap.rejected,
+    gap_count: snap.gapCount,
+    last_gap_ms: snap.lastGapMs,
+    since_last_step_ms: snap.sinceStepMs,
+    motion_events: snap.motionEvents,
+    note: "cadence 为网页算法推导值（derived），不是 CMPedometer 的 currentCadence",
+  };
+}
+
+function onExportSteps() {
+  const events = state.step.eventLog();
+  if (!events.length) return;
+  const pair = currentSourcePair();
+  let text;
+  try {
+    text = buildStepEventsCsv(events, {
+      source: pair.source,
+      sensor: pair.sensor,
+      startWallMs: state.startedWallMs ?? Date.now(),
+    });
+  } catch (err) {
+    dom.exportResult.textContent = `逐峰事件导出失败：${String((err && err.message) || err)}`;
+    return;
+  }
+  const name = buildFilename("steps", formatStamp(new Date()), pair.source);
+  downloadText(name, text, "text/csv");
+  reportExport(`已生成 ${name}（${events.length} 行候选峰，含被拒原因）。`);
+}
+
+function onExportSamples() {
+  if (!state.contractSamples.length) return;
+  const pair = currentSourcePair();
+  let text;
+  try {
+    // 构造阶段就会逐条跑契约校验，不合规直接抛错——不生成"看起来合规"的文件
+    text = buildContractSamplesCsv(state.contractSamples);
+  } catch (err) {
+    dom.exportResult.textContent =
+      `契约样本未通过校验，已拒绝导出：${String((err && err.message) || err)}`;
+    setVerdict(dom.exportState, "校验未通过", "is-fail");
+    return;
+  }
+  const name = buildFilename("samples", formatStamp(new Date()), pair.source);
+  downloadText(name, text, "text/csv");
+  reportExport(
+    `已生成 ${name}（${state.contractSamples.length} 条 17 字段样本，已逐条通过契约校验）。`
+  );
+}
+
+async function onExportExperimentJson() {
+  const rounds = state.experiment.rounds;
+  if (!rounds.length) return;
+  const pair = currentSourcePair();
+  const sessionIds = [...new Set(rounds.map((r) => r.session_id).filter(Boolean))];
+  const text = JSON.stringify(
+    buildExperimentJson({
+      rounds,
+      summary: state.experiment.summary(),
+      params: STEP_PARAMS,
+      sessionId: state.sessionId,
+      sessionIds,
+      source: pair.source,
+      sensor: pair.sensor,
+      environment: summarizeEnvForExport(state.envReport),
+      calibration: state.calib.summary(),
+      appVersion: APP_VERSION,
+      generatedAt: Date.now(),
+    }),
+    null,
+    2
+  );
+  const name = buildFilename("exp", formatStamp(new Date()), pair.source);
+  downloadText(name, text, "application/json");
+  const endpoint = isLocalDevHost() ? DEV_SAVE_ENDPOINT : null;
+  const saved = await trySaveToDevServer(endpoint, name, text);
+  reportExport(
+    saved.ok
+      ? `已生成 ${name}，${saved.message}`
+      : `已生成 ${name}（${rounds.length} 轮），仅下载到浏览器（${saved.message}）。`
+  );
+}
+
+function onExportExperimentCsv() {
+  const rounds = state.experiment.rounds;
+  if (!rounds.length) return;
+  const pair = currentSourcePair();
+  const text = buildExperimentCsv(rounds);
+  const name = buildFilename("expcsv", formatStamp(new Date()), pair.source);
+  downloadText(name, text, "text/csv");
+  reportExport(`已生成 ${name}（${rounds.length} 轮，人工真值与算法预测分列）。`);
+}
+
 function reportExport(text) {
   dom.exportResult.textContent = text;
   setVerdict(dom.exportState, "已导出", "is-ok");
@@ -939,6 +1602,17 @@ function bindEvents() {
   dom.btnExportJson.addEventListener("click", () => {
     onExportJson();
   });
+  dom.btnExportSteps.addEventListener("click", onExportSteps);
+  dom.btnExportSamples.addEventListener("click", onExportSamples);
+
+  dom.btnExpStart.addEventListener("click", onExpStart);
+  dom.btnExpEnd.addEventListener("click", () => endExperimentRound(false));
+  dom.btnExpSave.addEventListener("click", onExpSave);
+  dom.btnExpCancel.addEventListener("click", onExpCancel);
+  dom.btnExportExp.addEventListener("click", () => {
+    onExportExperimentJson();
+  });
+  dom.btnExportExpCsv.addEventListener("click", onExportExperimentCsv);
 
   dom.selSource.addEventListener("change", () => {
     const kind = dom.selSource.value;
@@ -965,6 +1639,28 @@ function bindEvents() {
   });
 
   dom.btnCalibrate.addEventListener("click", onCalibrateClick);
+
+  dom.selStepWindow.addEventListener("change", () => {
+    state.stepWindowMs = Number(dom.selStepWindow.value) || 5000;
+    renderStepChart(performance.now());
+  });
+
+  dom.selStepScale.addEventListener("change", () => {
+    state.stepScaleMode = dom.selStepScale.value === "fixed" ? "fixed" : "auto";
+    renderStepChart(performance.now());
+  });
+
+  if (dom.stepChips) {
+    dom.stepChips.addEventListener("click", (e) => {
+      const btn = e.target && e.target.closest ? e.target.closest(".chip") : null;
+      if (!btn) return;
+      const key = btn.dataset.sch;
+      if (!key || !(key in state.stepChannels)) return;
+      state.stepChannels[key] = !state.stepChannels[key];
+      btn.classList.toggle("is-on", state.stepChannels[key]);
+      renderStepChart(performance.now());
+    });
+  }
 
   dom.selWindow.addEventListener("change", () => {
     state.windowMs = Number(dom.selWindow.value) || 5000;
@@ -1084,6 +1780,87 @@ function maybeRunSmoke(params) {
     root.dataset.labNetworkCalls = String(state.networkCalls);
     root.dataset.labWavePoints = String(state.wave.agmag.size);
     root.dataset.labCalibReady = String(state.calib.ready);
+
+    // ---- E-W3：步态链路自检 ----
+    // 这里只读"算法算出来的东西"，不调整任何参数。MOCK 下步数是合成信号的真值，
+    // 只能证明链路通、契约能导出，不能证明真实准确率。
+    const nowMs = performance.now();
+    const snap = state.step.snapshot(nowMs);
+    const pair = currentSourcePair();
+
+    root.dataset.labSteps = String(snap.steps);
+    root.dataset.labSpm = snap.cadenceSpm === null ? "" : String(snap.cadenceSpm);
+    root.dataset.labSpm5 = snap.cadenceWindow5Spm === null ? "" : String(snap.cadenceWindow5Spm);
+    root.dataset.labSpm10 = snap.cadenceWindow10Spm === null ? "" : String(snap.cadenceWindow10Spm);
+    root.dataset.labSpm30 = snap.cadenceWindow30Spm === null ? "" : String(snap.cadenceWindow30Spm);
+    root.dataset.labStepState = snap.state;
+    root.dataset.labStepMode = snap.mode;
+    root.dataset.labConf = String(snap.confidence);
+    root.dataset.labQuality = snap.quality;
+    root.dataset.labCoverage = snap.coveragePct === null ? "" : String(snap.coveragePct);
+    root.dataset.labCand = String(snap.candidateCount);
+    root.dataset.labAccepted = String(snap.acceptedCount);
+    root.dataset.labRejected = String(snap.rejectedCount);
+    root.dataset.labThreshold = snap.threshold === null ? "" : snap.threshold.toFixed(3);
+    root.dataset.labPeriodicity = snap.periodicity === null ? "" : String(snap.periodicity);
+    root.dataset.labGateOpen = String(snap.gateOpen);
+    root.dataset.labMotionEvents = String(snap.motionEvents.length);
+    const funnelSum =
+      snap.acceptedCount + snap.gateRejectedCount + snap.supersededCount + snap.pendingHoldCount;
+    root.dataset.labFunnelBalanced = String(funnelSum === snap.candidateCount);
+    root.dataset.labGateRejected = String(snap.gateRejectedCount);
+    root.dataset.labSuperseded = String(snap.supersededCount);
+    root.dataset.labPendingHold = String(snap.pendingHoldCount);
+    root.dataset.labReversedRejects = String(snap.reversedRejectCount);
+    root.dataset.labSegmentBreaks = String(snap.segmentBreaks);
+
+    // 导出路径必须真跑一遍：只有"构造器返回了字符串"才算链路通
+    let stepCsvBytes = 0;
+    let stepCsvRows = 0;
+    let stepCsvCols = 0;
+    try {
+      const events = state.step.eventLog();
+      const csv = buildStepEventsCsv(events, {
+        source: pair.source,
+        sensor: pair.sensor,
+        startWallMs: state.startedWallMs ?? Date.now(),
+      });
+      stepCsvBytes = new TextEncoder().encode(csv).length;
+      const lines = csv.split("\r\n").filter((l) => l.length > 0);
+      stepCsvRows = Math.max(0, lines.length - 1);
+      stepCsvCols = lines.length ? lines[0].split(",").length : 0;
+    } catch (_err) {
+      stepCsvBytes = -1;
+    }
+    root.dataset.labStepCsvBytes = String(stepCsvBytes);
+    root.dataset.labStepCsvRows = String(stepCsvRows);
+    root.dataset.labStepCsvCols = String(stepCsvCols);
+
+    let sampleCsvBytes = 0;
+    let sampleRows = 0;
+    let contractOk = "";
+    try {
+      const csv = buildContractSamplesCsv(state.contractSamples);
+      sampleCsvBytes = new TextEncoder().encode(csv).length;
+      sampleRows = state.contractSamples.length;
+      contractOk = "true";
+    } catch (err) {
+      sampleCsvBytes = -1;
+      contractOk = String((err && err.message) || err);
+    }
+    root.dataset.labSampleCsvBytes = String(sampleCsvBytes);
+    root.dataset.labSampleRows = String(sampleRows);
+    root.dataset.labContractOk = contractOk;
+
+    const check = state.step.selfCheck();
+    root.dataset.labSelfCheckOk = String(check.ok);
+    root.dataset.labSelfCheckSteps = String(check.countedSteps);
+    root.dataset.labSelfCheckIndex = String(check.stepIndexMonotonic);
+
+    root.dataset.labExpRounds = String(state.experiment.rounds.length);
+    root.dataset.labExpOpen = String(state.experiment.isOpen);
+    root.dataset.labExpBtnStart = String(!dom.btnExpStart.disabled);
+    root.dataset.labExpBtnSave = String(!dom.btnExpSave.disabled);
   }, seconds * 1000);
 }
 
@@ -1149,7 +1926,8 @@ function boot() {
   });
 
   dom.footerMeta.textContent =
-    `契约版本 ${CONTRACT_VERSION} · 应用版本 ${APP_VERSION} · 阶段 E-W2 · 不产出 17 字段样本（步频算法在 E-W3 实现）`;
+    `契约版本 ${CONTRACT_VERSION} · 应用版本 ${APP_VERSION} · 阶段 E-W3 · 算法参数 ${STEP_PARAMS.version}` +
+    ` · 步数为网页推导值（derived），非 CMPedometer`;
 
   runEnvironmentProbe();
   buildSource("real");
@@ -1168,6 +1946,19 @@ function boot() {
   renderWaveform(performance.now());
   updateCalibUi();
   dom.btnCalibrate.disabled = true;
+
+  // E-W3 初始态：步态卡片显式显示"—"，不显示 0 步——
+  // "还没开始测"和"测了但一步都没走"是两件事。
+  renderStepUi(null);
+  renderStepChart(performance.now());
+  renderExperimentUi();
+  setVerdict(dom.stepState, "未开始", "");
+  setVerdict(dom.plotState, "空闲", "");
+  setVerdict(dom.expState, "未开始", "");
+  dom.btnExpStart.disabled = true;
+  dom.btnExpEnd.disabled = true;
+  dom.btnExpSave.disabled = true;
+  dom.btnExpCancel.disabled = true;
 
   // 供自动化冒烟检查读取的就绪标记
   document.documentElement.dataset.labBoot = "ok";

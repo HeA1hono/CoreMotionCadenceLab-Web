@@ -98,6 +98,28 @@ export class WaveformBuffer {
   }
 
   /**
+   * 取 [t0, t1] 内的原始样本（按时间顺序）。
+   *
+   * 与 columnize 的区别：这里不做列聚合，返回逐点值。
+   * 自相关需要原始序列，聚合后的包络会把周期信息抹掉。
+   *
+   * @returns {Array<{t:number,v:number}>}
+   */
+  slice(t0, t1, maxPoints = 4096) {
+    const out = [];
+    if (!Number.isFinite(t0) || !Number.isFinite(t1) || t1 < t0) return out;
+    const start = this._firstIndexAtOrAfter(t0);
+    for (let k = start; k < this._size; k += 1) {
+      const i = (this._head + k) % this.capacity;
+      const t = this._t[i];
+      if (t > t1) break;
+      out.push({ t, v: this._v[i] });
+      if (out.length >= maxPoints) break;
+    }
+    return out;
+  }
+
+  /**
    * 把 [t0, t1] 内的样本按像素列聚合。
    *
    * @returns {Array<{min:number,max:number,last:number,count:number}|null>}
