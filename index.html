@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light">
 <meta name="referrer" content="no-referrer">
-<title>CoreMotionCadenceLab · E-W2 真实波形</title>
+<title>CoreMotionCadenceLab · E-W3 步数与步频</title>
 <link rel="stylesheet" href="./style.css">
 </head>
 <body>
@@ -14,13 +14,20 @@
 <header class="topbar">
   <div class="topbar-main">
     <h1>CoreMotionCadenceLab</h1>
-    <p class="sub">阶段 E-W2 · Safari DeviceMotion 实时波形</p>
+    <p class="sub">阶段 E-W3 · Safari DeviceMotion 步数与步频估算</p>
   </div>
   <div class="topbar-badges">
     <span class="badge" id="badge-context">上下文检测中</span>
     <span class="badge" id="badge-source">来源：—</span>
   </div>
 </header>
+
+<nav class="quick-nav" aria-label="快速跳转">
+  <a href="#card-steps">⑦ 步数步频</a>
+  <a href="#card-stepplot">⑧ 检测可视化</a>
+  <a href="#card-exp">⑨ 人工对照</a>
+  <a href="#card-export">⑥ 导出</a>
+</nav>
 
 <main>
   <section class="card" id="card-env">
@@ -233,26 +240,228 @@
     <div class="btn-row">
       <button class="btn btn-primary" id="btn-export-csv" type="button" disabled>导出原始波形 CSV</button>
       <button class="btn" id="btn-export-json" type="button" disabled>导出诊断 JSON</button>
+      <button class="btn" id="btn-export-steps" type="button" disabled>导出逐峰事件 CSV</button>
+      <button class="btn" id="btn-export-samples" type="button" disabled>导出契约样本 CSV</button>
     </div>
     <p class="result" id="export-result"></p>
     <p class="source-line" id="export-source">来源待定</p>
     <p class="net-line" id="net-counter">网络请求计数启动中…</p>
     <p class="note">
-      导出文件名一律带 <code>_WEB_REAL</code> 或 <code>_WEB_MOCK</code>；CSV 每行第 14、15 列分别是
+      导出文件名一律带 <code>_WEB_REAL</code> 或 <code>_WEB_MOCK</code>；原始 CSV 每行第 14、15 列分别是
       <code>source</code>（REAL / MOCK）与 <code>sensor</code>（devicemotion / synth）。
       CSV 里的加速度<strong>始终是未校准的原始值</strong>，屏幕上的基线校准不会写进文件。
       所有数据只在浏览器内生成，导出即本地下载，不上传任何第三方。
+    </p>
+    <p class="note">
+      <strong>逐峰事件 CSV</strong>记录每一个候选峰（含被拒原因），是复核误检/漏检的唯一依据；
+      <strong>契约样本 CSV</strong>是按 17 字段契约每秒采样一条的推导值，导出前会逐条跑契约校验，
+      任一条不通过就不生成文件。
+    </p>
+  </section>
+
+  <section class="card" id="card-steps">
+    <div class="card-head">
+      <h2>⑦ 实时步数与步频</h2>
+      <span class="verdict" id="step-state">静止</span>
+    </div>
+
+    <div class="step-hero">
+      <div class="hero-metric">
+        <span class="k">累计检测步数</span>
+        <span class="v" id="m-steps">0</span>
+        <span class="u">步</span>
+      </div>
+      <div class="hero-metric hero-accent">
+        <span class="k">实时步频</span>
+        <span class="v" id="m-spm">—</span>
+        <span class="u">SPM</span>
+      </div>
+    </div>
+
+    <div class="grid grid-3 mt">
+      <div class="metric"><span class="k">最近 5 秒</span><span class="v" id="m-spm5">—</span><span class="u">SPM</span></div>
+      <div class="metric"><span class="k">最近 10 秒</span><span class="v" id="m-spm10">—</span><span class="u">SPM</span></div>
+      <div class="metric"><span class="k">最近 30 秒</span><span class="v" id="m-spm30">—</span><span class="u">SPM</span></div>
+    </div>
+
+    <div class="grid grid-4 mt">
+      <div class="metric"><span class="k">检测置信度</span><span class="v" id="m-conf">—</span><span class="u">%</span></div>
+      <div class="metric"><span class="k">数据质量</span><span class="v" id="m-quality">—</span></div>
+      <div class="metric"><span class="k">采样覆盖</span><span class="v" id="m-coverage">—</span><span class="u">%</span></div>
+      <div class="metric"><span class="k">最近步伐</span><span class="v" id="m-last-step">—</span><span class="u">秒前</span></div>
+    </div>
+
+    <p class="note" id="step-note">
+      <strong>实时步频</strong>用最近 6 步的中位间隔，分辨率高；
+      <strong>5 / 10 / 30 秒</strong>用「窗口内步数 ÷ 覆盖时长」，停步会自然回落，
+      代价是 5 秒窗里一步就是 12 SPM。<strong>三者口径不同，不可互相替代。</strong>
+      步数为网页算法推导值（derived），不是 CMPedometer 的 numberOfSteps。
+    </p>
+    <p class="note" id="step-mode-note" hidden></p>
+
+    <h3 class="chart-title">运动起止记录</h3>
+    <ul class="plain-list compact" id="motion-list">
+      <li class="check-empty">尚无记录</li>
+    </ul>
+  </section>
+
+  <section class="card" id="card-stepplot">
+    <div class="card-head">
+      <h2>⑧ 步伐检测可视化</h2>
+      <span class="verdict" id="plot-state">空闲</span>
+    </div>
+
+    <div class="field-row">
+      <label class="field">
+        <span>时间窗</span>
+        <select id="sel-step-window">
+          <option value="2000">2 秒</option>
+          <option value="5000" selected>5 秒</option>
+          <option value="10000">10 秒</option>
+          <option value="15000">15 秒</option>
+          <option value="30000">30 秒</option>
+          <option value="60000">60 秒</option>
+        </select>
+      </label>
+      <label class="field field-inline">
+        <span>纵轴</span>
+        <select id="sel-step-scale">
+          <option value="auto" selected>自动</option>
+          <option value="fixed">固定 0–20</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="chip-row" id="step-chips">
+      <button class="chip is-on" data-sch="raw" type="button">原始 |a|</button>
+      <button class="chip is-on" data-sch="filtered" type="button">滤波信号</button>
+      <button class="chip is-on" data-sch="threshold" type="button">检测阈值</button>
+      <button class="chip is-on" data-sch="steps" type="button">步伐标记</button>
+      <button class="chip is-on" data-sch="rejected" type="button">被拒候选</button>
+    </div>
+
+    <div class="wave-wrap">
+      <canvas id="wave-steps" height="158"></canvas>
+    </div>
+
+    <div class="grid grid-4 mt">
+      <div class="metric"><span class="k">候选峰</span><span class="v" id="m-cand">0</span></div>
+      <div class="metric"><span class="k">通过闸门</span><span class="v" id="m-accepted">0</span></div>
+      <div class="metric"><span class="k">已计步</span><span class="v" id="m-counted">0</span></div>
+      <div class="metric"><span class="k">当前阈值</span><span class="v" id="m-threshold">—</span><span class="u">m/s²</span></div>
+    </div>
+    <p class="note note-tight" id="step-funnel">判定漏斗：—</p>
+
+    <h3 class="chart-title">拒绝原因分解</h3>
+    <div class="table-wrap">
+      <table class="gap-table">
+        <thead>
+          <tr><th>原因</th><th>次数</th><th>含义</th></tr>
+        </thead>
+        <tbody id="reject-body">
+          <tr><td colspan="3" class="empty">暂无拒绝记录</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="note" id="plot-note">
+      三角是算法采纳的峰（实心=已计入步数，空心=已采纳但节奏未确认）；灰叉是被拒候选。
+      <strong>误检与漏检只能定性判断：</strong>本页没有逐拍人工标注，人工计数只给总数，
+      所以「多计了几步」与「漏计了几步」无法分离，净误差为 0 也可能是二者相互抵消。
+      逐峰 CSV 记录了每个候选的时间、幅值、阈值、突出度与拒绝原因，可用于事后逐条复盘。
+    </p>
+  </section>
+
+  <section class="card" id="card-exp">
+    <div class="card-head">
+      <h2>⑨ 人工计数对照实验</h2>
+      <span class="verdict" id="exp-state">未开始</span>
+    </div>
+
+    <p class="note note-warn">
+      <strong>人工计数是真值，算法步数是预测。</strong>两者在界面上、表格里、导出文件中
+      始终分列显示，任何一列都不会被改名成含糊的「步数」。
+      百分比误差的分母是人工计数，不是算法结果——用预测值当分母会把误差算小。
+    </p>
+
+    <div class="field-row">
+      <label class="field">
+        <span>运动类型</span>
+        <select id="sel-motion-type">
+          <option value="walk" selected>步行</option>
+          <option value="march">原地踏步</option>
+          <option value="run">跑步</option>
+          <option value="other">其他</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>握持方式</span>
+        <select id="sel-posture">
+          <option value="hand" selected>手持（屏幕朝上）</option>
+          <option value="pocket">口袋</option>
+          <option value="armband">臂包</option>
+          <option value="other">其他</option>
+        </select>
+      </label>
+    </div>
+    <div class="field-row">
+      <label class="field">
+        <span>目标步频（可选）</span>
+        <input id="inp-target-spm" type="number" min="0" max="240" step="1" inputmode="numeric" placeholder="如 120">
+      </label>
+      <label class="field">
+        <span>人工计数（走完再填）</span>
+        <input id="inp-manual" type="number" min="0" step="1" inputmode="numeric" placeholder="如 100">
+      </label>
+    </div>
+
+    <div class="btn-row">
+      <button class="btn btn-primary" id="btn-exp-start" type="button" disabled>开始一轮</button>
+      <button class="btn" id="btn-exp-end" type="button" disabled>结束本轮</button>
+      <button class="btn" id="btn-exp-save" type="button" disabled>保存人工计数</button>
+      <button class="btn" id="btn-exp-cancel" type="button" disabled>放弃本轮</button>
+    </div>
+    <p class="result" id="exp-result"></p>
+
+    <div class="grid grid-3 mt">
+      <div class="metric"><span class="k">本轮已计步</span><span class="v" id="m-round-steps">—</span><span class="u">步</span></div>
+      <div class="metric"><span class="k">本轮时长</span><span class="v" id="m-round-dur">—</span><span class="u">s</span></div>
+      <div class="metric"><span class="k">本轮实时步频</span><span class="v" id="m-round-spm">—</span><span class="u">SPM</span></div>
+    </div>
+
+    <h3 class="chart-title">已保存回合</h3>
+    <div class="table-wrap">
+      <table class="gap-table exp-table">
+        <thead>
+          <tr><th>回合</th><th>人工（真值）</th><th>算法（预测）</th><th>误差</th><th>绝对误差</th><th>绝对 %</th></tr>
+        </thead>
+        <tbody id="exp-body">
+          <tr><td colspan="6" class="empty">尚无已保存回合</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" id="exp-summary">尚无已提交的回合。</p>
+
+    <div class="btn-row">
+      <button class="btn" id="btn-export-exp" type="button" disabled>导出实验 JSON</button>
+      <button class="btn" id="btn-export-exp-csv" type="button" disabled>导出实验 CSV</button>
+    </div>
+    <p class="note">
+      每轮保存的是：人工真值、算法预测、绝对误差、百分比误差、方向（多计/少计）、
+      运动类型、握持方式、目标步频、参数版本、数据来源与数据质量。
+      回合结束即<strong>冻结</strong>算法步数——之后算法回溯补计不会改写已完成的回合。
     </p>
   </section>
 
   <section class="card card-quiet">
     <div class="card-head"><h2>阶段说明</h2></div>
     <ul class="plain-list">
-      <li><strong>本阶段不产出步频。</strong>步频估算算法计划在 E-W3 实现，此处若显示任何步数或步频即为伪造。</li>
+      <li><strong>本阶段的步数由算法推导，不是系统计步器。</strong>信号来自 <code>devicemotion</code> 的原始加速度，经带通滤波、自适应阈值、节奏与自相关双重确认后计步；不读 <code>CMPedometer</code>，也不写回任何系统服务。</li>
       <li><strong>页面必须顶层打开。</strong>iOS 26 存在 iframe 内 <code>devicemotion</code> 不派发的已知缺陷（WebKit Bug 301294）。</li>
-      <li><strong>屏幕需保持常亮。</strong>锁屏或切到后台，iOS 会挂起事件派发。</li>
-      <li><strong>与 Core Motion 的关系：</strong>本页读的是原始加速度，不是 <code>CMPedometer</code> 的计步结论，两者不可互换声明。</li>
-      <li><strong>波形不是"平滑后的漂亮曲线"。</strong>它刻意保留每个像素列的极值，看起来毛糙是正常的。</li>
+      <li><strong>屏幕需保持常亮。</strong>锁屏或切到后台，iOS 会挂起事件派发；步数不会跨中断补计。</li>
+      <li><strong>中断期间不产生步数。</strong>事件间隔超过 150 ms 即断开分段，空档内一个采样点都不生成——宁可少计，不凭空造步。</li>
+      <li><strong>波形的毛糙是刻意的。</strong>每个像素列保留最小/最大值，不做平滑，因为尖峰正是判步的依据。</li>
+      <li><strong>准确率必须由真机人工对照得出。</strong>本页只能给 SOURCE READY / LOCAL TEST PASS；没有 iPhone 上的 100 步实验，不得声称准确率。</li>
     </ul>
     <p class="footer-meta" id="footer-meta">契约版本 1.0</p>
   </section>
