@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light">
 <meta name="referrer" content="no-referrer">
-<title>CoreMotionCadenceLab · E-W1 传感器诊断</title>
+<title>CoreMotionCadenceLab · E-W2 真实波形</title>
 <link rel="stylesheet" href="./style.css">
 </head>
 <body>
@@ -14,7 +14,7 @@
 <header class="topbar">
   <div class="topbar-main">
     <h1>CoreMotionCadenceLab</h1>
-    <p class="sub">阶段 E-W1 · Safari DeviceMotion 兼容性与采集诊断</p>
+    <p class="sub">阶段 E-W2 · Safari DeviceMotion 实时波形</p>
   </div>
   <div class="topbar-badges">
     <span class="badge" id="badge-context">上下文检测中</span>
@@ -86,26 +86,104 @@
         <div class="metric"><span class="k">γ</span><span class="v" id="m-gamma">—</span></div>
       </div>
     </div>
+
+    <div class="calib-block">
+      <div class="btn-row">
+        <button class="btn" id="btn-calibrate" type="button" disabled>校准显示基线</button>
+        <span class="calib-state" id="calib-state">未校准</span>
+      </div>
+      <p class="note" id="calib-note">
+        把当前姿态的重力向量记为显示零点。<strong>只影响屏幕与波形，不改变导出</strong>：
+        CSV 里永远是未校准的原始值。
+      </p>
+      <p class="note note-warn">
+        <strong>校准只管一种姿态。</strong>它减的是一个固定向量，所以只在"和校准时握法相同"的前提下有效。
+        手机绕任意轴转 30°，即使完全没动，波形上也会冒出约 <strong>5 m/s²</strong> 的假加速度
+        （= 2×9.8×sin15°）；从平放改成竖直握持，残余可达 <strong>13.9 m/s²</strong>，比不校准还大。
+        握法变了就重新校准——这不是 bug，是减向量这个方法的固有代价，换来的是方向与正负号不失真。
+      </p>
+    </div>
+  </section>
+
+  <section class="card" id="card-wave">
+    <div class="card-head">
+      <h2>④ 实时波形</h2>
+      <span class="verdict" id="wave-state">空闲</span>
+    </div>
+    <div class="field-row wave-controls">
+      <label class="field">
+        <span>时间窗</span>
+        <select id="sel-window">
+          <option value="2000">2 秒</option>
+          <option value="5000" selected>5 秒</option>
+          <option value="15000">15 秒</option>
+          <option value="60000">60 秒</option>
+        </select>
+      </label>
+      <label class="field field-inline">
+        <span>纵轴</span>
+        <select id="sel-scale">
+          <option value="auto" selected>自动</option>
+          <option value="fixed">固定 ±20</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="chip-row" id="chips">
+      <button class="chip is-on" data-ch="agx" type="button">X</button>
+      <button class="chip is-on" data-ch="agy" type="button">Y</button>
+      <button class="chip is-on" data-ch="agz" type="button">Z</button>
+      <button class="chip is-on" data-ch="agmag" type="button">|a| 含重力</button>
+      <button class="chip is-on" data-ch="lmag" type="button">|a| 线性</button>
+    </div>
+
+    <h3 class="chart-title">三轴加速度</h3>
+    <div class="wave-wrap">
+      <canvas id="wave-axes" height="132"></canvas>
+    </div>
+
+    <h3 class="chart-title">加速度模长</h3>
+    <div class="wave-wrap">
+      <canvas id="wave-mags" height="112"></canvas>
+    </div>
+
+    <p class="note chart-note" id="wave-note">
+      每个像素列画的是该列内所有样本的<strong>最小值到最大值</strong>，不做平均、不抽点——
+      平均会把尖峰抹平，而尖峰正是判断"这一步踩下去没有"的依据。空白列表示那段时间没有数据。
+    </p>
   </section>
 
   <section class="card" id="card-rate">
     <div class="card-head">
-      <h2>④ 到达频率与中断监测</h2>
+      <h2>⑤ 到达频率与中断监测</h2>
       <span class="verdict" id="rate-state">空闲</span>
     </div>
     <div class="grid grid-5">
-      <div class="metric"><span class="k">实测频率</span><span class="v" id="m-hz">—</span><span class="u">Hz</span></div>
+      <div class="metric"><span class="k">瞬时频率</span><span class="v" id="m-window-hz">—</span><span class="u">Hz</span></div>
+      <div class="metric"><span class="k">有效采集率</span><span class="v" id="m-active-hz">—</span><span class="u">Hz</span></div>
+      <div class="metric"><span class="k">全程平均</span><span class="v" id="m-avg-hz">—</span><span class="u">Hz</span></div>
       <div class="metric"><span class="k">事件总数</span><span class="v" id="m-count">0</span></div>
       <div class="metric"><span class="k">已采时长</span><span class="v" id="m-elapsed">0.0</span><span class="u">s</span></div>
-      <div class="metric"><span class="k">距上一事件</span><span class="v" id="m-since">—</span><span class="u">ms</span></div>
-      <div class="metric"><span class="k">中断次数</span><span class="v" id="m-gaps">0</span></div>
     </div>
+    <p class="note">
+      <strong>瞬时频率</strong>是最近 2 秒的滑窗值，会随停顿骤降；
+      <strong>有效采集率</strong>已剔除中断时段，才是"传感器正常时的采样率"；
+      <strong>全程平均</strong>把中断也算进分母，长时间挂起后会明显偏低。三个数不可互相替代。
+    </p>
     <div class="grid grid-4 mt">
       <div class="metric"><span class="k">中位间隔</span><span class="v" id="m-median">—</span><span class="u">ms</span></div>
       <div class="metric"><span class="k">P95 间隔</span><span class="v" id="m-p95">—</span><span class="u">ms</span></div>
       <div class="metric"><span class="k">抖动 P95</span><span class="v" id="m-jitter">—</span><span class="u">ms</span></div>
       <div class="metric"><span class="k">设备自报间隔</span><span class="v" id="m-declared">—</span><span class="u">ms</span></div>
     </div>
+    <div class="grid grid-4 mt">
+      <div class="metric"><span class="k">中断次数</span><span class="v" id="m-gaps">0</span></div>
+      <div class="metric"><span class="k">中断合计</span><span class="v" id="m-gap-total">0.0</span><span class="u">s</span></div>
+      <div class="metric"><span class="k">停顿次数</span><span class="v" id="m-stall-count">0</span></div>
+      <div class="metric"><span class="k">距上一事件</span><span class="v" id="m-since">—</span><span class="u">ms</span></div>
+    </div>
+    <p class="note" id="trunc-note" hidden></p>
+    <p class="note" id="reject-note" hidden></p>
 
     <h3 class="chart-title">每秒事件数（最近 120 秒）</h3>
     <div class="chart-wrap">
@@ -116,11 +194,11 @@
       这一栏是判断"数据断了"还是"传感器没数据"的唯一客观依据。
     </p>
 
-    <h3 class="chart-title">中断记录</h3>
+    <h3 class="chart-title">中断与停顿记录</h3>
     <div class="table-wrap">
       <table class="gap-table">
         <thead>
-          <tr><th>序号</th><th>起始</th><th>持续</th><th>级别</th><th>归因</th></tr>
+          <tr><th>序号</th><th>类型</th><th>起始</th><th>持续</th><th>归因</th></tr>
         </thead>
         <tbody id="gap-body">
           <tr><td colspan="5" class="empty">暂无中断</td></tr>
@@ -131,7 +209,7 @@
 
   <section class="card" id="card-export">
     <div class="card-head">
-      <h2>⑤ 数据源与导出</h2>
+      <h2>⑥ 数据源与导出</h2>
       <span class="verdict" id="export-state">—</span>
     </div>
     <div class="field-row">
@@ -153,7 +231,7 @@
       </label>
     </div>
     <div class="btn-row">
-      <button class="btn btn-primary" id="btn-export-csv" type="button" disabled>导出原始事件 CSV</button>
+      <button class="btn btn-primary" id="btn-export-csv" type="button" disabled>导出原始波形 CSV</button>
       <button class="btn" id="btn-export-json" type="button" disabled>导出诊断 JSON</button>
     </div>
     <p class="result" id="export-result"></p>
@@ -162,6 +240,7 @@
     <p class="note">
       导出文件名一律带 <code>_WEB_REAL</code> 或 <code>_WEB_MOCK</code>；CSV 每行第 14、15 列分别是
       <code>source</code>（REAL / MOCK）与 <code>sensor</code>（devicemotion / synth）。
+      CSV 里的加速度<strong>始终是未校准的原始值</strong>，屏幕上的基线校准不会写进文件。
       所有数据只在浏览器内生成，导出即本地下载，不上传任何第三方。
     </p>
   </section>
@@ -173,6 +252,7 @@
       <li><strong>页面必须顶层打开。</strong>iOS 26 存在 iframe 内 <code>devicemotion</code> 不派发的已知缺陷（WebKit Bug 301294）。</li>
       <li><strong>屏幕需保持常亮。</strong>锁屏或切到后台，iOS 会挂起事件派发。</li>
       <li><strong>与 Core Motion 的关系：</strong>本页读的是原始加速度，不是 <code>CMPedometer</code> 的计步结论，两者不可互换声明。</li>
+      <li><strong>波形不是"平滑后的漂亮曲线"。</strong>它刻意保留每个像素列的极值，看起来毛糙是正常的。</li>
     </ul>
     <p class="footer-meta" id="footer-meta">契约版本 1.0</p>
   </section>

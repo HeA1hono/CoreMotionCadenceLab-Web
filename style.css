@@ -1,4 +1,4 @@
-/* CoreMotionCadenceLab · E-W1 诊断页样式
+/* CoreMotionCadenceLab · E-W2 诊断页样式
    目标：手机上一屏能看清关键数字，不靠颜色传达唯一信息（色盲友好）。 */
 
 :root {
@@ -148,6 +148,18 @@ main {
   font-size: 12.5px;
   line-height: 1.6;
   color: var(--text-2);
+}
+
+/* 会误导人的前提条件必须比普通说明更显眼，但不能做成错误红色——
+   它不是错，是适用范围。用警告色而不报警。 */
+.note-warn {
+  margin-top: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--warn);
+  background: var(--warn-bg);
+  border: 1px solid #f0d6a3;
+  border-radius: 6px;
 }
 
 .note code, .plain-list code, .footer-meta code {
@@ -518,4 +530,97 @@ td.empty { color: var(--text-3); text-align: center; padding: 14px; }
   main { padding: 12px 10px 36px; }
   .card { padding: 13px 13px 14px; }
   .metric .v { font-size: 14px; }
+}
+
+/* ---------- E-W2：波形与校准 ---------- */
+
+.calib-block {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border-soft);
+}
+
+.calib-block .btn-row { align-items: center; gap: 10px; }
+
+.calib-state {
+  font-size: 12px;
+  font-family: var(--mono);
+  color: var(--text-3);
+}
+
+.calib-state.is-ready { color: var(--ok); }
+.calib-state.is-capturing { color: var(--accent); }
+.calib-state.is-warn { color: var(--warn); }
+
+.wave-controls { margin-bottom: 8px; }
+
+.field-inline { min-width: 110px; flex: 0 1 110px; }
+
+/* 通道开关：用按钮而不是复选框，触控目标至少 36px 高 */
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 10px 0 2px;
+}
+
+.chip {
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1;
+  padding: 9px 11px;
+  min-height: 36px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-3);
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: color 0.12s ease, border-color 0.12s ease, background 0.12s ease;
+}
+
+.chip.is-on {
+  color: var(--text);
+  border-color: var(--accent);
+  background: var(--info-bg);
+  font-weight: 600;
+}
+
+.chip:active { background: var(--surface-2); }
+
+/* 波形画布：CSS 高度固定，位图尺寸由 JS 按 devicePixelRatio 放大 */
+.wave-wrap {
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  padding: 6px;
+  background: #fcfcfd;
+  overflow: hidden;
+}
+
+#wave-axes {
+  display: block;
+  width: 100%;
+  height: 132px;
+  touch-action: pan-y;
+}
+
+#wave-mags {
+  display: block;
+  width: 100%;
+  height: 112px;
+  touch-action: pan-y;
+}
+
+@media (max-width: 430px) {
+  .chip { padding: 8px 10px; font-size: 12px; }
+  .wave-controls .field { min-width: 0; flex: 1 1 45%; }
+}
+
+@media (max-width: 340px) {
+  main { padding: 10px 8px 32px; }
+  .card { padding: 11px 11px 12px; }
+  .chip { padding: 7px 8px; font-size: 11.5px; }
+  #wave-axes { height: 118px; }
+  #wave-mags { height: 100px; }
 }
