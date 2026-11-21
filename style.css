@@ -150,6 +150,11 @@ main {
   color: var(--text-2);
 }
 
+.gps-quality-note {
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+}
+
 /* 会误导人的前提条件必须比普通说明更显眼，但不能做成错误红色——
    它不是错，是适用范围。用警告色而不报警。 */
 .note-warn {
