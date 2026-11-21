@@ -286,16 +286,31 @@
 
     <div class="grid grid-4 mt">
       <div class="metric"><span class="k">检测置信度</span><span class="v" id="m-conf">—</span><span class="u">%</span></div>
-      <div class="metric"><span class="k">数据质量</span><span class="v" id="m-quality">—</span></div>
-      <div class="metric"><span class="k">采样覆盖</span><span class="v" id="m-coverage">—</span><span class="u">%</span></div>
+      <div class="metric"><span class="k">传感器质量</span><span class="v" id="m-quality">—</span></div>
+      <div class="metric"><span class="k">最近 5 秒覆盖</span><span class="v" id="m-coverage">—</span><span class="u">%</span></div>
       <div class="metric"><span class="k">最近步伐</span><span class="v" id="m-last-step">—</span><span class="u">秒前</span></div>
     </div>
 
+    <div class="grid grid-3 mt">
+      <div class="metric"><span class="k">全程覆盖</span><span class="v" id="m-total">—</span><span class="u">%</span></div>
+      <div class="metric"><span class="k">参考采样率</span><span class="v" id="m-refhz">—</span><span class="u">Hz</span></div>
+      <div class="metric"><span class="k">步频样本数</span><span class="v" id="m-spm-n">—</span><span class="u">个间隔</span></div>
+    </div>
+
+    <p class="note" id="quality-reason" hidden></p>
+
     <p class="note" id="step-note">
-      <strong>实时步频</strong>用最近 6 步的中位间隔，分辨率高；
-      <strong>5 / 10 / 30 秒</strong>用「窗口内步数 ÷ 覆盖时长」，停步会自然回落，
-      代价是 5 秒窗里一步就是 12 SPM。<strong>三者口径不同，不可互相替代。</strong>
+      <strong>实时步频</strong>取最近 9 个间隔，先按 Hampel 剔掉异常间隔，
+      再按时间加权求周期；<strong>5 / 10 / 30 秒</strong>用「窗口内步数 ÷ 覆盖时长」，
+      停步会自然回落，代价是 5 秒窗里一步就是 12 SPM。<strong>三者口径不同，不可互相替代。</strong>
       步数为网页算法推导值（derived），不是 CMPedometer 的 numberOfSteps。
+    </p>
+    <p class="note" id="step-quality-note">
+      <strong>三个质量指标不是一回事，别混着读：</strong>
+      传感器质量看最近 5 秒的事件密度（分母是全程参考采样率，不是窗口自推）；
+      全程覆盖只受中断影响，几乎不随窗口波动；
+      检测置信度只看「这段信号像不像一串有节律的步」，与采样密不密无关。
+      三者同时出现不同值是正常的——刚切回前台时就是这样。
     </p>
     <p class="note" id="step-mode-note" hidden></p>
 
