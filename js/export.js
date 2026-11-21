@@ -100,18 +100,10 @@ export const STEP_EVENTS_CSV_VERSION = "1.0";
  */
 export const RAW_CSV_VERSION = "1.1";
 
-function pad2(n) {
-  return String(n).padStart(2, "0");
-}
-
-/** 生成 20261119_231500 形式的时间戳，用于文件名。 */
-export function formatStamp(date) {
-  const d = date instanceof Date ? date : new Date(date);
-  return (
-    `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}` +
-    `_${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`
-  );
-}
+// 时间戳与下载这两个函数搬到了 download.js：GPS 页只用得到它们，
+// 而本模块还要拉 contract.js / experiment.js（约 38 KB）。
+// 这里 re-export，保证本模块的公开 API 与既有测试完全不变。
+export { formatStamp, downloadText } from "./download.js";
 
 /**
  * 校验 source / sensor 组合是否自洽。
@@ -424,22 +416,6 @@ export function buildFilename(kind, stamp, source) {
   return `${spec.prefix}_${stamp}_WEB_${source}.${spec.ext}`;
 }
 
-/** 触发浏览器下载。 */
-export function downloadText(filename, text, mime) {
-  if (typeof document === "undefined") {
-    throw new Error("downloadText 只能在浏览器中调用");
-  }
-  const blob = new Blob([text], { type: `${mime};charset=utf-8` });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.rel = "noopener";
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 4000);
-}
 
 /**
  * 尝试把文件存到本机开发服务器。
