@@ -89,23 +89,30 @@
 
     <div class="step-hero">
       <div class="hero-metric">
-        <span class="k">累计距离</span>
+        <span class="k">原始距离</span>
         <span class="v" id="m-gps-dist">—</span>
         <span class="u">m</span>
       </div>
       <div class="hero-metric hero-accent">
-        <span class="k">当前配速</span>
-        <span class="v" id="m-gps-pace">—</span>
-        <span class="u">/km</span>
+        <span class="k">确认距离</span>
+        <span class="v" id="m-gps-dist-trusted">—</span>
+        <span class="u">m</span>
       </div>
     </div>
 
-    <div class="grid grid-4 mt">
+    <div class="grid grid-3 mt">
       <div class="metric"><span class="k">当前速度</span><span class="v" id="m-gps-speed">—</span><span class="u">m/s</span></div>
+      <div class="metric"><span class="k">当前配速</span><span class="v" id="m-gps-pace">—</span><span class="u" id="m-gps-pace-unit">/km</span></div>
       <div class="metric"><span class="k">定位精度</span><span class="v" id="m-gps-acc">—</span><span class="u">m</span></div>
       <div class="metric"><span class="k">定位点数</span><span class="v" id="m-gps-count">0</span><span class="u">个</span></div>
+      <div class="metric"><span class="k">有效点数</span><span class="v" id="m-gps-accepted">0</span><span class="u">个</span></div>
+      <div class="metric"><span class="k">异常点数</span><span class="v" id="m-gps-anomaly">0</span><span class="u">个</span></div>
+      <div class="metric"><span class="k">定位质量</span><span class="v" id="m-gps-quality">—</span><span class="u"></span></div>
       <div class="metric"><span class="k">数据延迟</span><span class="v" id="m-gps-lat">—</span><span class="u">ms</span></div>
     </div>
+    <p class="note gps-quality-note" id="gps-quality-note">
+      开始采集后，这里说明原始路程和确认距离差在哪里。静止漂移和跳点留在原始距离里，确认距离只计入跨过定位精度门的净位移。
+    </p>
 
     <p class="note" id="gps-note">
       GPS 与运动传感器来自<strong>两套独立硬件</strong>，时间戳分属不同时钟域：
