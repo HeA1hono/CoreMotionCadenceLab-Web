@@ -301,7 +301,8 @@
 
     <p class="note" id="step-note">
       <strong>实时步频</strong>取最近 9 个间隔，先按 Hampel 剔掉异常间隔，
-      再按时间加权求周期；<strong>5 / 10 / 30 秒</strong>用「窗口内步数 ÷ 覆盖时长」，
+      再<strong>等权</strong>求平均周期（曾试过时间加权，收敛快 0.66 秒但抖动是等权的 6 倍，
+      故改为等权）；<strong>5 / 10 / 30 秒</strong>用「窗口内步数 ÷ 覆盖时长」，
       停步会自然回落，代价是 5 秒窗里一步就是 12 SPM。<strong>三者口径不同，不可互相替代。</strong>
       步数为网页算法推导值（derived），不是 CMPedometer 的 numberOfSteps。
     </p>

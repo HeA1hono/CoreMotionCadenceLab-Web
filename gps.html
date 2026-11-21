@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>E-W4 · GPS 与运动传感器协同分析</title>
+<link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+<div class="mock-ribbon" id="mock-ribbon" hidden></div>
+
+<header class="topbar">
+  <div class="topbar-main">
+    <h1>E-W4 · GPS 与运动传感器协同分析</h1>
+    <p class="sub">
+      同一根时间轴上的两套硬件：<code>devicemotion</code> 的加速度与
+      <code>geolocation</code> 的位置。用于观察采样节奏、时间戳对齐与中断恢复，
+      <strong>不用 GPS 配速换算步数</strong>，也不向系统写入任何运动记录。
+    </p>
+    <p class="source-line" id="page-meta">加载中…</p>
+  </div>
+</header>
+
+<main>
+  <section class="card" id="card-env">
+    <div class="card-head">
+      <h2>① 环境自检</h2>
+      <span class="verdict" id="env-verdict">检查中</span>
+    </div>
+    <ul class="check-list" id="env-list">
+      <li class="check-empty">正在检测…</li>
+    </ul>
+    <p class="note" id="env-note"></p>
+  </section>
+
+  <section class="card" id="card-perm">
+    <div class="card-head">
+      <h2>② 权限与启动</h2>
+      <span class="verdict" id="perm-verdict">未请求</span>
+    </div>
+    <p class="note">
+      两项权限都要点按钮拿：<strong>运动传感器</strong>与<strong>定位</strong>。
+      定位权限在 iOS 上会弹出系统对话框，选「允许」。
+      若之前拒绝过，需要到 设置 → Safari → 位置 里改，或完全关闭 Safari 再重开。
+    </p>
+    <div class="btn-row">
+      <button class="btn btn-primary" id="btn-perm-motion" type="button">请求运动权限</button>
+      <button class="btn btn-primary" id="btn-perm-gps" type="button">请求定位权限</button>
+      <button class="btn" id="btn-start" type="button" disabled>开始采集</button>
+      <button class="btn" id="btn-stop" type="button" disabled>停止</button>
+    </div>
+    <p class="note" id="perm-note"></p>
+  </section>
+
+  <section class="card" id="card-gps">
+    <div class="card-head">
+      <h2>③ GPS 数据源</h2>
+      <span class="verdict" id="gps-state">未启动</span>
+    </div>
+
+    <p class="source-line">
+      数据来源：<strong id="gps-origin">—</strong>
+      <span id="gps-origin-sub"></span>
+    </p>
+
+    <div class="field-row">
+      <label class="field">
+        <span>模式</span>
+        <select id="sel-gps-mode">
+          <option value="off">关闭</option>
+          <option value="real">真实定位（Geolocation）</option>
+          <option value="replay">GPX 回放</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>回放文件</span>
+        <input type="file" id="file-gpx" accept=".gpx,application/gpx+xml" />
+      </label>
+      <label class="field">
+        <span>回放倍速</span>
+        <select id="sel-gps-speed">
+          <option value="1">1×</option>
+          <option value="4">4×</option>
+          <option value="10">10×</option>
+          <option value="30">30×</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="step-hero">
+      <div class="hero-metric">
+        <span class="k">累计距离</span>
+        <span class="v" id="m-gps-dist">—</span>
+        <span class="u">m</span>
+      </div>
+      <div class="hero-metric hero-accent">
+        <span class="k">当前配速</span>
+        <span class="v" id="m-gps-pace">—</span>
+        <span class="u">/km</span>
+      </div>
+    </div>
+
+    <div class="grid grid-4 mt">
+      <div class="metric"><span class="k">当前速度</span><span class="v" id="m-gps-speed">—</span><span class="u">m/s</span></div>
+      <div class="metric"><span class="k">定位精度</span><span class="v" id="m-gps-acc">—</span><span class="u">m</span></div>
+      <div class="metric"><span class="k">定位点数</span><span class="v" id="m-gps-count">0</span><span class="u">个</span></div>
+      <div class="metric"><span class="k">数据延迟</span><span class="v" id="m-gps-lat">—</span><span class="u">ms</span></div>
+    </div>
+
+    <p class="note" id="gps-note">
+      GPS 与运动传感器来自<strong>两套独立硬件</strong>，时间戳分属不同时钟域：
+      后者用页面单调时钟（<code>performance.now()</code>），前者用墙上时间（epoch）。
+      本页在会话开始时取一对锚点把两者对齐，并把对齐后的残差
+      （<code>latency</code>，即"位置确定 → 我们收到"隔了多久）如实报出来，
+      <strong>不做自动校正</strong>——因为"真实延迟应该是多少"没有先验，
+      拿它去校时钟等于用被测量去校准量具。
+    </p>
+    <p class="note note-warn" id="gps-replay-note" hidden>
+      <strong>当前是 GPX 离线回放，不是真实定位。</strong>
+      回放的延迟恒为 0（点是按时间线播出来的，不是测出来的），
+      因此<strong>不可</strong>用这份数据评价定位性能或 GPS 精度。
+      另请留意下方"文件来历"：本仓库可用的 GPX 多由跑道几何参数生成。
+    </p>
+    <p class="note" id="gps-provenance-note" hidden></p>
+    <p class="note" id="gps-err" hidden></p>
+  </section>
+
+  <section class="card" id="card-timeline">
+    <div class="card-head">
+      <h2>④ 统一时间轴与跨源对照</h2>
+      <span class="verdict" id="tl-state">空闲</span>
+    </div>
+
+    <div class="grid grid-3 mt">
+      <div class="metric"><span class="k">运动传感器覆盖</span><span class="v" id="m-tl-motion">—</span><span class="u">%</span></div>
+      <div class="metric"><span class="k">GPS 覆盖</span><span class="v" id="m-tl-gps">—</span><span class="u">%</span></div>
+      <div class="metric"><span class="k">时间轴长度</span><span class="v" id="m-tl-buckets">—</span><span class="u">秒</span></div>
+    </div>
+
+    <div class="grid grid-3 mt">
+      <div class="metric"><span class="k">断档区间</span><span class="v" id="m-tl-outages">—</span><span class="u">次</span></div>
+      <div class="metric"><span class="k">断档总时长</span><span class="v" id="m-tl-outage-ms">—</span><span class="u">s</span></div>
+      <div class="metric"><span class="k">时钟跳变</span><span class="v" id="m-tl-drift">—</span></div>
+    </div>
+    <p class="note" id="outage-note" hidden></p>
+    <p class="note note-warn" id="timeline-cap-note" hidden></p>
+
+    <h3 class="chart-title">跨源一致性（证据聚合）</h3>
+    <div class="grid grid-3 mt">
+      <div class="metric"><span class="k">推算步幅</span><span class="v" id="m-stride">—</span><span class="u">m/步</span></div>
+      <div class="metric"><span class="k">一致性判定</span><span class="v" id="m-stride-verdict">—</span></div>
+      <div class="metric"><span class="k">2T 间隔占比</span><span class="v" id="m-double-ratio">—</span><span class="u">%</span></div>
+    </div>
+    <p class="note" id="stride-note" hidden></p>
+
+    <p class="note">
+      <strong>判定由证据聚合，不由单一阈值。</strong>
+      「推算步幅超过 1.8 m 就判腰斩」这条已撤掉：配速 4′58″/km、步频 75 SPM 时
+      推算步幅就是 2.68 m，可能只是配速取 1 km 平均、步频取瞬时值，或对方 App
+      按单腿计。<strong>只有人工计数能给出「已确认」，其余最多到「疑似异常／需要人工验证」</strong>。
+      这里只提示、不修正——拿 GPS 改传感器输出会同时污染两个源。
+    </p>
+
+    <h3 class="chart-title">证据</h3>
+    <ul class="plain-list compact" id="evidence-list">
+      <li class="check-empty">还没有足够的配对数据</li>
+    </ul>
+
+    <h3 class="chart-title">人工计数基准</h3>
+    <div class="field-row">
+      <label class="field">
+        <span>步数（从开始到现在）</span>
+        <input id="human-steps" type="number" min="0" step="1" inputmode="numeric" placeholder="例如 620">
+      </label>
+      <label class="field">
+        <span>计时（秒，可留空）</span>
+        <input id="human-sec" type="number" min="0" step="1" inputmode="numeric" placeholder="留空">
+      </label>
+    </div>
+    <div class="btn-row">
+      <button class="btn" id="btn-human-apply" type="button">用作基准</button>
+    </div>
+    <p class="note" id="human-note" hidden></p>
+    <p class="note note-warn">
+      <strong>不把 GPS 配速换算成步数。</strong><code>步数 = 距离 ÷ 步幅</code>
+      需要先假设步幅，假设一错步数就是编的。GPS 只用来<em>质疑</em>步频，
+      不用来<em>产生</em>步频。
+    </p>
+  </section>
+
+  <section class="card" id="card-export">
+    <div class="card-head"><h2>⑤ 导出</h2></div>
+    <p class="note">
+      三个文件各自的来源标记不同：轨迹与时间轴带
+      <code>REAL_GPS</code> / <code>REPLAY</code>，诊断 JSON 额外记录
+      <code>provenance</code>（GPX 文件自身是实测还是几何生成）。
+      文件名里也带来源，便于在文件管理器里分辨。
+    </p>
+    <div class="btn-row">
+      <button class="btn" id="btn-export-gps" type="button" disabled>GPS 轨迹 CSV</button>
+      <button class="btn" id="btn-export-timeline" type="button" disabled>时间轴 CSV</button>
+      <button class="btn" id="btn-export-gpsdiag" type="button" disabled>跨源诊断 JSON</button>
+    </div>
+    <p class="note" id="export-note"></p>
+  </section>
+
+  <section class="card card-quiet">
+    <div class="card-head"><h2>阶段说明</h2></div>
+    <ul class="plain-list">
+      <li><strong>本页不计算准确率。</strong>它只把两个源的采样、时间戳与中断摊在同一根轴上，
+        让人能看出"哪个源在什么时候没给数据"。准确率必须由真机人工对照实验给出。</li>
+      <li><strong>步频仍是 E-W3.1 那套算法</strong>，参数版本见页脚。本阶段<strong>没有修改</strong>
+        已验证的步频核心逻辑，只增加了对它的独立观测手段。</li>
+      <li><strong>不向系统定位服务写入任何东西。</strong>只读 <code>watchPosition</code>，
+        不读写 <code>CMPedometer</code>，不接触任何第三方运动 App。</li>
+      <li><strong>GPX 回放不是测量。</strong>回放数据的"延迟恒为 0"是构造出来的，
+        把它当定位性能会得出完全错误的结论。</li>
+      <li><strong>页面必须顶层打开。</strong>iOS 26 存在 iframe 内 <code>devicemotion</code>
+        不派发的已知缺陷（WebKit Bug 301294）。</li>
+    </ul>
+    <p class="footer-meta" id="footer-meta">E-W4</p>
+  </section>
+</main>
+
+<script type="module" src="./js/app_gps.js"></script>
+</body>
+</html>
