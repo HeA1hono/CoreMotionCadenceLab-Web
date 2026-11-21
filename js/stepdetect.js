@@ -70,7 +70,7 @@ import { WaveformBuffer } from "./waveform.js";
 
 /** 算法参数。改任何一个都必须同步改 docs/EW3_ALGORITHM.md 与变异清单。 */
 export const STEP_PARAMS = Object.freeze({
-  version: "ew3-1.0.0",
+  version: "ew3.1-1.0.0",
 
   /** 重采样网格频率（Hz）。50 Hz 对 0.5–6 Hz 步态信号有 8 倍余量。 */
   gridHz: 50,
@@ -113,13 +113,47 @@ export const STEP_PARAMS = Object.freeze({
   periodicityWindowMs: 4000,
 
   /** 距最后一步超过此值即视为步频归零（ms）。 */
-  staleStepMs: 2500,
+  staleStepMs: 2000,
   /** 距最后一步超过此值记为一次「暂停」（ms）。 */
   pauseMs: 2500,
   /** 事件静默超过此值记为传感器迟滞（ms）。 */
   interruptWarnMs: 1000,
   /** 事件静默超过此值记为传感器中断（ms）。 */
   interruptFailMs: 3000,
+
+  /* ------------------------------------------------ 实时步频估计（E-W3.1） */
+
+  /**
+   * 参与步频估计的间隔个数（不是步数）。
+   *
+   * 为什么从 5 提到 9：
+   *   旧实现取最近 6 步 = 5 个间隔，`60000 / median(5 个间隔)`。
+   *   5 个样本的中位数**只能取其中某一个值**，是离散量——相邻两个间隔差 10 ms，
+   *   中位就可能从 A 跳到 B，SPM 当场跳 10。实测 cv=5% 的真实步态下
+   *   SPM 在 115–125 之间来回跳，55 秒里跳 22 次。
+   *   9 个间隔把标准误降到 √(5/9) ≈ 0.75 倍，代价是延迟增加约 4 步。
+   */
+  cadenceIntervals: 9,
+  /**
+   * Hampel 异常间隔阈值：偏离中位超过 K×1.4826×MAD 的间隔不参与估计。
+   *
+   * 1.4826 是把 MAD 折算成正态标准差的一致常数。
+   * 漏检一步会产生 2× 周期（1200 ms vs 600 ms），偏离远超任何合理 K；
+   * 取 3.5 而不是 3，是为了不误杀 cv=8% 的真实步态变异（3.5σ ≈ ±28%）。
+   */
+  cadenceHampelK: 3.5,
+  /* ------------------------------------------------ 三档质量指标（E-W3.1） */
+
+  /** ① 传感器质量窗口（ms）：最近 5 秒的事件密度。 */
+  sensorQualityWindowMs: 5000,
+  /** 参考采样率的累计间隔数下限：少于这个数不判定覆盖率（避免开局和恢复期误报）。 */
+  refHzMinSamples: 20,
+  /** ② 全程覆盖率统计的最小会话时长（ms）。 */
+  totalCoverageMinMs: 3000,
+  /** 质量升级（变好）需要持续多久才生效（ms）。 */
+  qualityUpHoldMs: 800,
+  /** 质量降级（变差）需要持续多久才生效（ms）。 */
+  qualityDownHoldMs: 1500,
 
   /** 数据质量统计窗口（ms）。 */
   qualityWindowMs: 3000,
@@ -142,6 +176,30 @@ export const MOTION_STATE_LABEL = Object.freeze({
   MOVING: "运动",
   UNSTABLE: "检测不稳定",
   INTERRUPTED: "传感器中断",
+});
+
+/**
+ * 质量等级的六个取值。
+ *
+ * 为什么不只有「好/一般/差」：后三个都带**原因**，而且是用户能理解的原因。
+ * 把「刚切回前台」和「信号真的弱」都显示成「差」，用户只会觉得页面在乱跳。
+ */
+export const QualityLevel = Object.freeze({
+  GOOD: "good",
+  FAIR: "fair",
+  POOR: "poor",
+  MEASURING: "measuring",
+  RECOVERING: "recovering",
+  INTERRUPTED: "interrupted",
+});
+
+export const QUALITY_LABEL = Object.freeze({
+  good: "好",
+  fair: "一般",
+  poor: "差",
+  measuring: "建立中",
+  recovering: "恢复中",
+  interrupted: "中断",
 });
 
 /** 峰值被拒的原因。界面按此分类展示，不允许合并成一个"其他"。 */
@@ -391,6 +449,20 @@ export class StepDetector {
     this._moved = false;
     this._paused = false;
 
+    // 累计采样率（E-W3.1）。只累加"段内"间隔，断段不计——
+    // 断段如果算进去，平均采样率会被空档拖低，覆盖率随之虚高。
+    // 这是"覆盖率"的分母，必须独立于任何滑动窗口，否则就成了循环论证：
+    // 旧实现用最近 3 秒自己的事件数反推期望频率，再拿它当分母，结果恒等于 1。
+    this._hzSumMs = 0;
+    this._hzCount = 0;
+    this._prevEventT = null;
+    this._firstEventT = null;
+
+    // 质量状态的滞回记忆（E-W3.1）
+    this._qualityLevel = null; // 当前生效的等级
+    this._qualityPending = null; // { level, sinceMs } 待确认的等级
+    this._qualityReason = null; // 中断 / 恢复中 / 信号弱 ...
+
     this._mode = this.params.signalMode === SignalMode.LINEAR ? SignalMode.LINEAR : SignalMode.GRAVITY_MAG;
     this._modeReason = null;
     this._linearZeroRun = 0;
@@ -434,6 +506,17 @@ export class StepDetector {
     const value = this._selectSignal(rec);
     if (value === null) return false;
 
+    // 累计采样率：只累加段内间隔（断段会把平均速率拖低，覆盖率随之虚高）
+    if (this._prevEventT !== null) {
+      const dt = t - this._prevEventT;
+      if (dt > 0 && dt <= this.params.maxInterpGapMs) {
+        this._hzSumMs += dt;
+        this._hzCount += 1;
+      }
+    }
+    this._prevEventT = t;
+
+    if (this._firstEventT === null) this._firstEventT = t;
     this._eventCount += 1;
     this._lastEventT = t;
     this._eventTimes.push(t);
@@ -904,6 +987,9 @@ export class StepDetector {
    */
   snapshot(nowMs) {
     const p = this.params;
+    // now 可以早于最后一个事件：导出复盘、单测回放都会拿历史时刻来查。
+    // 但所有依赖 now 的差值都必须夹住下界（见下面的 Math.max(0, …)），
+    // 否则 sinceEvent 变成负数，中断/恢复判定会静默失效、且表现成"一切正常"。
     const now = Number.isFinite(nowMs) ? nowMs : this._lastEventT ?? 0;
 
     // 会话末尾往往没有"下一个峰"来触发结算，这里按时间把保持窗口关掉。
@@ -931,8 +1017,8 @@ export class StepDetector {
     const c10 = this._cadenceWindow(now, 10000);
     const c30 = this._cadenceWindow(now, 30000);
 
-    const quality = this._quality(now);
-    const confidence = this._confidence(state, now, quality);
+    const quality = this._qualityDetail(now);
+    const confidence = this._confidence(state, now);
 
     return {
       source: this.source,
@@ -959,6 +1045,10 @@ export class StepDetector {
 
       cadenceSpm: live.spm,
       cadenceProvisional: live.provisional,
+      // 步频估计的可审计信息：用了几个间隔、剔掉几个异常、估计出的周期
+      cadenceSampleCount: live.samples,
+      cadenceDroppedOutliers: live.droppedOutliers,
+      cadencePeriodMs: live.periodMs,
       cadenceWindow5Spm: c5.spm,
       cadenceWindow10Spm: c10.spm,
       cadenceWindow30Spm: c30.spm,
@@ -983,8 +1073,25 @@ export class StepDetector {
 
       quality: quality.level,
       qualityLabel: quality.label,
-      coveragePct: round1(quality.coverage * 100),
-      expectedHz: round1(quality.expectedHz),
+      qualityRaw: quality.rawLevel,
+      qualityReason: quality.reason,
+      // ① 传感器质量（最近 5 秒）
+      sensorPct: quality.sensorPct,
+      sensorCoverage: quality.sensor,
+      refHz: quality.refHz,
+      refSampleCount: quality.refSamples,
+      recentEventCount: quality.recentEvents,
+      expectedEventCount: quality.expectedEvents,
+      sensorWindowMs: quality.windowMs,
+      inRecovery: quality.inRecovery,
+      // ② 全程覆盖（只受中断影响）
+      totalPct: quality.totalPct,
+      totalCoverage: quality.total,
+      gapTotalMs: quality.gapMs,
+      sessionMs: quality.sessionMs,
+      // 兼容旧字段名（导出与既有测试仍读这两个）
+      coveragePct: quality.sensorPct,
+      expectedHz: quality.refHz,
       gapCount: this._gaps.length,
       lastGapMs: this._gaps.length ? this._gaps[this._gaps.length - 1].durationMs : 0,
 
@@ -1015,17 +1122,86 @@ export class StepDetector {
     return MotionState.STILL;
   }
 
+  /**
+   * 实时步频：最近 N 个间隔 → Hampel 剔异常 → 截尾均值 → 60000/周期。
+   *
+   * 为什么不是 `60000 / median(最近 6 步)`：
+   *   ① 5 个间隔的中位数是**离散量**，只能取那 5 个值之一。相邻间隔差 10 ms，
+   *      中位就从 A 跳到 B，SPM 当场跳 10——这是测量方式造成的抖动，不是人走快了。
+   *   ② 中位数只用了排序后的中间值，其余 4 个样本的信息全丢，方差比截尾均值大。
+   *   ③ 没有异常值处理：漏检一步的 2× 间隔会原样进入（虽然中位数抗单点，
+   *      但连续两个异常就压不住了）。
+   *
+   * 现在：9 个间隔 → 剔掉偏离中位超过 3.5×1.4826×MAD 的（Hampel）→ 等权求均值。
+   * 稳定、连续、可解释；而且没有任何"把数按住不动"的操作。
+   */
   _cadenceLive(now) {
     const p = this.params;
-    if (this._lastCountedT === null) return { spm: null, provisional: false };
-    if (now - this._lastCountedT > p.staleStepMs) return { spm: 0, provisional: false };
-    const tail = this._counted.slice(-6);
-    if (tail.length < 2) return { spm: null, provisional: true };
+    if (this._lastCountedT === null) {
+      return { spm: null, provisional: false, samples: 0, droppedOutliers: 0, periodMs: null };
+    }
+    if (now - this._lastCountedT > p.staleStepMs) {
+      return { spm: 0, provisional: false, samples: 0, droppedOutliers: 0, periodMs: null };
+    }
+
+    // 取 N+1 个步，得到 N 个间隔
+    const tail = this._counted.slice(-(p.cadenceIntervals + 1));
+    if (tail.length < 3) {
+      return { spm: null, provisional: true, samples: tail.length - 1, droppedOutliers: 0, periodMs: null };
+    }
+
     const iv = [];
-    for (let i = 1; i < tail.length; i += 1) iv.push(tail[i].t - tail[i - 1].t);
-    const med = median(iv);
-    if (!med || med <= 0) return { spm: null, provisional: true };
-    return { spm: Math.round(60000 / med), provisional: tail.length < 4 };
+    for (let i = 1; i < tail.length; i += 1) {
+      const dt = tail[i].t - tail[i - 1].t;
+      // 超过 maxStepIntervalMs 的是停顿，不是节奏，不能进估计——
+      // 否则"停一下再走"会把周期拉长，恢复后的头几步步频会偏低。
+      if (dt > 0 && dt <= p.maxStepIntervalMs) iv.push(dt);
+    }
+    if (iv.length < 2) {
+      return { spm: null, provisional: true, samples: iv.length, droppedOutliers: 0, periodMs: null };
+    }
+
+    const clean = hampelFilter(iv, p.cadenceHampelK);
+    const list = clean.length >= 2 ? clean : iv;
+    // 等权均值，**不做时间加权**。
+    //
+    // 曾试过线性加权（越新权重越大，最新样本占约 20% 权重）：收敛能快 0.66 秒
+    // （4.58 s vs 5.24 s），代价是稳态抖动 0.7 → 4.2 次/分（cv=5%）、
+    // 7.5 → 17.6 次/分（cv=8%），实测见 reports/EW31 的诚实对比。
+    // 用户报的是"显示不稳"，不是"跟不上"，所以这里优先压抖动。
+    const period = this._meanPeriod(list);
+    if (!period || period <= 0) {
+      return { spm: null, provisional: true, samples: list.length, droppedOutliers: 0, periodMs: null };
+    }
+
+    return {
+      spm: Math.round(60000 / period),
+      // 4 个间隔（=5 步）以下仍标"暂定"，与旧版口径一致，界面用 ≈ 前缀
+      provisional: list.length < 4,
+      samples: list.length,
+      droppedOutliers: iv.length - list.length,
+      periodMs: round1(period),
+    };
+  }
+
+  /**
+   * 等权平均周期（list 从旧到新；均值与顺序无关，保留顺序只为语义清楚）。
+   *
+   * 为什么不用中位数：中位数只能取那 9 个间隔之一。相邻间隔差 10 ms，
+   * 中位就从 A 跳到 B，SPM 当场跳 10 —— 这是**测量方式**造成的抖动，
+   * 不是人走快了。均值是连续量，同样的输入只会小幅变化。
+   *
+   * 为什么不做时间加权：加权能让收敛快 0.66 秒，但稳态抖动是等权的 6 倍。
+   * 取舍依据见调用处注释与 EW31 报告，不在这里重复。
+   *
+   * 均值对离群值比中位数敏感，这是它唯一的弱点——由上游 hampelFilter 负责挡住。
+   * 漏检一步会产生 2× 周期，若不剔除，均值会被拽着腰斩。
+   */
+  _meanPeriod(list) {
+    if (!Array.isArray(list) || list.length === 0) return null;
+    let sum = 0;
+    for (let i = 0; i < list.length; i += 1) sum += list[i];
+    return sum / list.length;
   }
 
   /**
@@ -1054,25 +1230,166 @@ export class StepDetector {
     return { spm: Math.round(spm), provisional: covered < windowMs * 0.5 };
   }
 
-  _quality(now) {
+  /**
+   * 三档质量指标（E-W3.1 重构）。
+   *
+   * 旧实现只有一个 `quality`，而且算错了：
+   *
+   *   旧代码用「最近 3 秒的事件数 ÷ 用它自己反推出的期望数」算覆盖率。
+   *   expectedHz = (n−1)/span，expected = expectedHz×3s，coverage = n/expected
+   *   → coverage ≡ n·span/((n−1)·3000)。只要 span 接近 3000，它就恒≈1.0。
+   *   这不是"覆盖率"，是"事件密度是否均匀"的伪指标，稳定时永远显示满格，
+   *   一旦事件变少（比如刚从后台回来）就骤然掉到 0.6%，然后花 3 秒爬回 100%。
+   *   用户看到的"好/差反复跳"就是这个爬坡。
+   *
+   * 现在分成三个互不替代的指标：
+   *
+   *   ① sensor  —— 最近 5 秒的事件密度，分母是**全程累计采样率**（段内间隔的均值），
+   *                不来自任何滑动窗口，因此不会自我满足。
+   *   ② total   —— 全程覆盖 = 1 − 中断总时长/会话时长。只受中断影响，不随窗口波动。
+   *   ③ confidence —— 算法对"这是一串有节律的步"的判断，见 _confidence。
+   *
+   * 三个数可以同时看起来不一样，这是**正确**的：
+   * 刚恢复时 sensor 低、total 高、confidence 可能高（人确实在走）。
+   * 把它们合并成一个"质量"必然丢信息。
+   */
+  _qualityDetail(now) {
     const p = this.params;
-    const recent = this._eventTimes.filter((t) => t >= now - p.qualityWindowMs);
-    let expectedHz = 60;
-    if (recent.length >= 3) {
-      const span = recent[recent.length - 1] - recent[0];
-      if (span > 0) expectedHz = ((recent.length - 1) / span) * 1000;
+
+    // ---- 参考采样率：段内间隔的累计均值，与会话长度无关
+    const refHz = this._hzCount >= p.refHzMinSamples ? 1000 / (this._hzSumMs / this._hzCount) : null;
+
+    // ---- ① 传感器质量（最近 5 秒）
+    const winMs = p.sensorQualityWindowMs;
+    const recent = this._eventTimes.filter((t) => t >= now - winMs);
+    const sessionMs = this._firstEventT === null ? 0 : Math.max(0, now - this._firstEventT);
+    // 会话不足一个窗口时，期望值按实际可用时长缩放——否则开局必然报低覆盖
+    const coveredMs = Math.min(winMs, sessionMs);
+    const expected = refHz !== null && coveredMs > 0 ? (refHz * coveredMs) / 1000 : 0;
+    const sensor = expected > 0 ? clamp01(recent.length / expected) : null;
+
+    // ---- ② 全程覆盖
+    const gapMs = this._gaps.reduce((acc, g) => acc + g.durationMs, 0);
+    const total = sessionMs >= p.totalCoverageMinMs ? clamp01(1 - gapMs / sessionMs) : null;
+
+    // ---- 状态归因：中断 / 恢复中 / 按数值分档
+    const sinceEvent = this._lastEventT === null ? null : Math.max(0, now - this._lastEventT);
+    const lastGapEnd = this._gaps.length ? this._gaps[this._gaps.length - 1].endMs : null;
+    // 「恢复中」的判据是**窗口还没填满**，不是一个拍脑袋的 2 秒宽限。
+    // 断段结束后，最近 5 秒的窗口里天然只有一部分数据；这段爬坡是物理事实，
+    // 把它报成「差」等于在怪用户"你刚从后台回来"，而不是反映信号本身好坏。
+    const sinceGapEnd = lastGapEnd !== null && now >= lastGapEnd ? now - lastGapEnd : Infinity;
+    const windowFilling = sinceGapEnd < p.sensorQualityWindowMs;
+    const inRecovery = windowFilling && sensor !== null && sensor < 0.85;
+
+    let rawLevel;
+    let reason = null;
+    if (sinceEvent !== null && sinceEvent > p.interruptWarnMs) {
+      rawLevel = "interrupted";
+      reason = sinceEvent > p.interruptFailMs ? "传感器中断" : "传感器迟滞";
+    } else if (sensor === null) {
+      rawLevel = "measuring";
+      reason = "正在建立采样基准";
+    } else if (inRecovery) {
+      // 刚从断段里出来：窗口里本来就只有一部分数据，这时候说"差"是在怪用户
+      rawLevel = "recovering";
+      reason = "断段后恢复中";
+    } else if (sensor >= 0.85) {
+      rawLevel = "good";
+    } else if (sensor >= 0.6) {
+      rawLevel = "fair";
+    } else {
+      rawLevel = "poor";
+      reason = "最近 5 秒事件明显偏少";
     }
-    const expected = (expectedHz * p.qualityWindowMs) / 1000;
-    const coverage = expected > 0 ? clamp01(recent.length / expected) : 0;
-    const recentGaps = this._gaps.filter((g) => g.endMs >= now - 10000).length;
-    let level = "good";
-    if (coverage < 0.7 || recentGaps >= 3) level = "poor";
-    else if (coverage < 0.9 || recentGaps > 0) level = "fair";
-    const label = level === "good" ? "好" : level === "fair" ? "一般" : "差";
-    return { coverage, expectedHz, level, label, recentGaps };
+
+    const level = this._applyQualityHysteresis(rawLevel, now);
+    const label = QUALITY_LABEL[level] ?? level;
+
+    return {
+      level,
+      rawLevel,
+      label,
+      reason,
+      sensor,
+      sensorPct: sensor === null ? null : round1(sensor * 100),
+      total,
+      totalPct: total === null ? null : round1(total * 100),
+      refHz: refHz === null ? null : round1(refHz),
+      refSamples: this._hzCount,
+      recentEvents: recent.length,
+      expectedEvents: expected > 0 ? Math.round(expected) : null,
+      windowMs: winMs,
+      gapMs: Math.round(gapMs),
+      sessionMs: Math.round(sessionMs),
+      inRecovery,
+      // 兼容旧字段名（导出与既有测试仍在用 quality/coverage）
+      coverage: sensor,
+      expectedHz: refHz,
+      recentGaps: this._gaps.filter((g) => g.endMs >= now - 10000).length,
+    };
   }
 
-  _confidence(state, now, quality) {
+  /**
+   * 质量等级的滞回。
+   *
+   * 目的：一两个异常事件不该让显示跳一下。变好要持续 800 ms，变差要持续 1500 ms
+   * （变差更慢，因为"变差"更容易是偶发漏事件；宁可晚一点报坏，也别来回闪）。
+   *
+   * 只对 good/fair/poor 三档生效。interrupted / recovering / measuring 是**有原因的
+   * 状态**，延迟显示等于隐瞒原因，所以立即生效。
+   */
+  _applyQualityHysteresis(rawLevel, now) {
+    const p = this.params;
+    const graded = (lv) => lv === "good" || lv === "fair" || lv === "poor";
+
+    if (!graded(rawLevel)) {
+      this._qualityLevel = rawLevel;
+      this._qualityPending = null;
+      return rawLevel;
+    }
+    if (this._qualityLevel === null || !graded(this._qualityLevel)) {
+      this._qualityLevel = rawLevel;
+      this._qualityPending = null;
+      return rawLevel;
+    }
+    if (rawLevel === this._qualityLevel) {
+      this._qualityPending = null;
+      return this._qualityLevel;
+    }
+
+    const rank = { poor: 0, fair: 1, good: 2 };
+    const improving = rank[rawLevel] > rank[this._qualityLevel];
+    const needMs = improving ? p.qualityUpHoldMs : p.qualityDownHoldMs;
+
+    if (!this._qualityPending || this._qualityPending.level !== rawLevel) {
+      this._qualityPending = { level: rawLevel, sinceMs: now };
+      return this._qualityLevel;
+    }
+    if (now - this._qualityPending.sinceMs >= needMs) {
+      this._qualityLevel = rawLevel;
+      this._qualityPending = null;
+      return rawLevel;
+    }
+    return this._qualityLevel;
+  }
+
+  /** 兼容旧调用点：只要等级与标签。 */
+  _quality(now) {
+    return this._qualityDetail(now);
+  }
+
+  /**
+   * 检测置信度：算法对"这是一串有节律的步"的判断。
+   *
+   * E-W3.1 的两处改动：
+   *   ① 去掉 coverage 权重。旧版把「数据质量」的覆盖率塞进置信度，
+   *      于是刚恢复时覆盖率从 0 爬坡，置信度跟着从 0 爬到 100 —— 两个指标一起假跳。
+   *      置信度回答的是「这段信号像不像走路」，与「采样密不密」是两回事。
+   *   ② 把自相关系数 ρ 计入。ρ 是"信号以这个周期重复"的直接证据，
+   *      E-W3 里它只在开闸门时用一次，之后就不再参与判断，浪费了。
+   */
+  _confidence(state, now) {
     const p = this.params;
     if (state === MotionState.STILL) return { score: 0, level: "none" };
 
@@ -1086,10 +1403,11 @@ export class StepDetector {
     }
 
     const amp = clamp01(this._p95Abs / p.amplitudeFullScale);
-    const coverage = clamp01(quality.coverage);
     const gate = this._gateOpen ? 1 : 0.25;
+    // ρ 可能为 null（样本不足），此时按 0 处理——"没有证据"不等于"有证据"
+    const rho = this._lastPeriodicity === null ? 0 : clamp01(this._lastPeriodicity);
 
-    const score = 100 * (0.35 * rhythm + 0.25 * amp + 0.25 * coverage + 0.15 * gate);
+    const score = 100 * (0.45 * rhythm + 0.25 * amp + 0.2 * gate + 0.1 * rho);
     const level = score >= 70 ? "high" : score >= 45 ? "medium" : "low";
     return { score: Math.round(score), level };
   }
@@ -1157,6 +1475,35 @@ function cvPct(values) {
   for (const v of values) acc += (v - m) * (v - m);
   const sd = Math.sqrt(acc / (values.length - 1));
   return (sd / m) * 100;
+}
+
+/**
+ * Hampel 滤波：剔除偏离中位超过 K×1.4826×MAD 的样本。
+ *
+ * 为什么需要它：漏检一步会产生一个 2× 周期的间隔，多检会产生 0.5× 的间隔。
+ * 这两种都会把均值直接带偏，而且看起来"只是这一步慢了点"。
+ * 中位数本身抗单点异常，但中位数是离散量、会跳变——所以先剔异常、再求均值，
+ * 兼顾"抗异常"与"连续变化"。
+ *
+ * MAD = 0 的退化情形必须单独处理：当超过一半样本完全相等时（例如合成信号里
+ * 每步周期严格相同），MAD 恒为 0，`k×1.4826×MAD = 0` 会把阈值压成"只保留等于
+ * 中位的值"，看起来像全剔光；若直接原样返回，漏检造成的 2× 周期又会漏网。
+ * 两种都不对。这里的做法是：MAD=0 说明样本高度一致，那么任何显著偏离都算异常，
+ * 用中位数的相对偏差（50%）兜底——500 ms 的正常周期遇到 1000 ms 的漏检间隔，
+ * 偏离 100%，一定被剔。
+ */
+export function hampelFilter(values, k = 3.5) {
+  if (!Array.isArray(values) || values.length < 3) return Array.isArray(values) ? values.slice() : [];
+  const med = median(values);
+  const dev = values.map((v) => Math.abs(v - med));
+  const mad = median(dev);
+  if (!(mad > 0)) {
+    // 中位数为 0 或负时相对偏差无意义，此时确实无从判断，原样返回
+    if (!(med > 0)) return values.slice();
+    return values.filter((v) => Math.abs(v - med) <= med * 0.5);
+  }
+  const limit = k * 1.4826 * mad;
+  return values.filter((v) => Math.abs(v - med) <= limit);
 }
 
 function round1(v) {

@@ -148,6 +148,10 @@ const dom = {
   mQuality: el("m-quality"),
   mCoverage: el("m-coverage"),
   mLastStep: el("m-last-step"),
+  mTotal: el("m-total"),
+  mRefHz: el("m-refhz"),
+  mSpmN: el("m-spm-n"),
+  qualityReason: el("quality-reason"),
   motionList: el("motion-list"),
   stepNote: el("step-note"),
   stepModeNote: el("step-mode-note"),
@@ -550,6 +554,10 @@ function renderStepUi(snap, nowMs, stats) {
     dom.mQuality.textContent = "—";
     dom.mCoverage.textContent = "—";
     dom.mLastStep.textContent = "—";
+    if (dom.mTotal) dom.mTotal.textContent = "—";
+    if (dom.mRefHz) dom.mRefHz.textContent = "—";
+    if (dom.mSpmN) dom.mSpmN.textContent = "—";
+    if (dom.qualityReason) dom.qualityReason.hidden = true;
     dom.mCand.textContent = "0";
     dom.mAccepted.textContent = "0";
     dom.mCounted.textContent = "0";
@@ -574,9 +582,29 @@ function renderStepUi(snap, nowMs, stats) {
   // 实际是"没有东西可置信"——两种含义必须区分。
   dom.mConf.textContent =
     snap.state === MotionState.STILL ? "—" : String(snap.confidence);
+  // ① 传感器质量（最近 5 秒事件密度）
   dom.mQuality.textContent = snap.qualityLabel;
-  dom.mCoverage.textContent = snap.coveragePct === null ? "—" : String(Math.round(snap.coveragePct));
+  dom.mCoverage.textContent = snap.sensorPct === null ? "—" : String(Math.round(snap.sensorPct));
   dom.mLastStep.textContent = relativeText(nowMs, snap.lastStepMs);
+  // ② 全程覆盖（只受中断影响）
+  if (dom.mTotal) dom.mTotal.textContent = snap.totalPct === null ? "—" : String(Math.round(snap.totalPct));
+  if (dom.mRefHz) dom.mRefHz.textContent = snap.refHz === null ? "—" : snap.refHz.toFixed(1);
+  if (dom.mSpmN) dom.mSpmN.textContent = snap.cadenceSampleCount === null ? "—" : String(snap.cadenceSampleCount);
+
+  // 质量的「原因」必须写出来。只给一个"差"字，用户不知道是信号弱、
+  // 是刚切回前台、还是手机被放下了——三种情况的应对方式完全不同。
+  if (dom.qualityReason) {
+    if (snap.qualityReason) {
+      dom.qualityReason.hidden = false;
+      dom.qualityReason.textContent = `传感器质量：${snap.qualityLabel} —— ${snap.qualityReason}`;
+      dom.qualityReason.className =
+        snap.quality === "poor"
+          ? "note note-warn"
+          : "note note-tight";
+    } else {
+      dom.qualityReason.hidden = true;
+    }
+  }
 
   dom.mCand.textContent = String(snap.candidateCount);
   dom.mAccepted.textContent = String(snap.acceptedCount);
@@ -1478,7 +1506,26 @@ function summarizeStepForExport(snap) {
     periodicity: snap.periodicity,
     confidence: snap.confidence,
     confidence_level: snap.confidenceLevel,
+    // 三档质量分开导出。合并成一个 quality 就等于把三种不同的病
+    // 记成同一个症状，事后无法复盘"到底是信号弱还是刚切回前台"。
     quality: snap.quality,
+    quality_raw: snap.qualityRaw,
+    quality_reason: snap.qualityReason,
+    sensor_quality_pct: snap.sensorPct,
+    sensor_window_ms: snap.sensorWindowMs,
+    sensor_recent_events: snap.recentEventCount,
+    sensor_expected_events: snap.expectedEventCount,
+    total_coverage_pct: snap.totalPct,
+    gap_total_ms: snap.gapTotalMs,
+    session_ms: snap.sessionMs,
+    in_recovery: snap.inRecovery,
+    ref_sample_hz: snap.refHz,
+    ref_sample_count: snap.refSampleCount,
+    // 步频估计的可审计信息
+    cadence_sample_count: snap.cadenceSampleCount,
+    cadence_dropped_outliers: snap.cadenceDroppedOutliers,
+    cadence_period_ms: snap.cadencePeriodMs,
+    // 兼容旧字段名
     coverage_pct: snap.coveragePct,
     expected_hz: snap.expectedHz,
     threshold_ms2: snap.threshold,
@@ -1797,7 +1844,11 @@ function maybeRunSmoke(params) {
     root.dataset.labStepMode = snap.mode;
     root.dataset.labConf = String(snap.confidence);
     root.dataset.labQuality = snap.quality;
+    root.dataset.labQualityRaw = snap.qualityRaw ?? "";
     root.dataset.labCoverage = snap.coveragePct === null ? "" : String(snap.coveragePct);
+    root.dataset.labTotalCoverage = snap.totalPct === null ? "" : String(snap.totalPct);
+    root.dataset.labRefHz = snap.refHz === null ? "" : String(snap.refHz);
+    root.dataset.labSpmSamples = String(snap.cadenceSampleCount ?? "");
     root.dataset.labCand = String(snap.candidateCount);
     root.dataset.labAccepted = String(snap.acceptedCount);
     root.dataset.labRejected = String(snap.rejectedCount);
