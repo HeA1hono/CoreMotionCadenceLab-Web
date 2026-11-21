@@ -20,6 +20,8 @@
  *   - 不向系统定位服务写入任何东西——本模块只读 `watchPosition`。
  */
 
+import { annotateGpsQuality, appendAnnotated } from "./gps_quality.js";
+
 /** 数据来源。这是导出与界面上的**第一分类**，不允许被省略或合并。 */
 export const GpsOrigin = Object.freeze({
   REAL: "REAL_GPS",
@@ -589,45 +591,52 @@ export class ReplayGpsSource {
  *   - `null`    ：算不出来（时间不前进、点数不足）。
  *
  * 差分算出的速度对定位噪声极其敏感：GPS 抖动 5 m、间隔 1 s，就能造出 5 m/s
- * 的假速度。所以这里同时给出 `impliedAccuracy`，让下游能判断这个速度值不值信。
+ * 的假速度。`distCumM` 仍是这条原始路程，方便对照漂移；确认距离、配速能不能
+ * 显示，在 `gps_quality.js` 里另算，不回写经纬度。
  *
  * @param {Array<object>} fixes 按 tMonoMs 升序
  * @returns {Array<object>} 每个 fix 附带派生字段的新数组
  */
+function rawStep(prevRow, f) {
+  const cumM = prevRow ? prevRow.distCumM : 0;
+  const row = { ...f, distCumM: cumM, speedDerivedMps: null, paceSecPerKm: null, dtMs: null };
+  if (prevRow) {
+    const dist = haversineM(prevRow, f);
+    const dtMs = f.tMonoMs - prevRow.tMonoMs;
+    if (dist !== null && dtMs > 0) {
+      row.distCumM = cumM + dist;
+      row.dtMs = dtMs;
+      row.speedDerivedMps = dist / (dtMs / 1000);
+    }
+  }
+  // 数学配速保留原口径：芯片速度优先，没有才用差分。页面显示不直接用它。
+  const speedForPace =
+    row.speedMps !== null && Number.isFinite(row.speedMps)
+      ? row.speedMps
+      : row.speedDerivedMps;
+  row.paceSecPerKm = speedToPaceSecPerKm(speedForPace);
+  row.paceSpeedSource =
+    row.speedMps !== null && Number.isFinite(row.speedMps) ? "reported" : "derived";
+  if (row.speedSource === null && row.speedDerivedMps !== null) {
+    row.speedSource = "derived";
+  }
+  return row;
+}
+
 export function deriveGpsTrack(fixes) {
   if (!Array.isArray(fixes) || fixes.length === 0) return [];
-  const out = [];
-  let cumM = 0;
+  const raw = [];
   let prev = null;
-
   for (const f of fixes) {
-    const row = { ...f, distCumM: cumM, speedDerivedMps: null, paceSecPerKm: null, dtMs: null };
-    if (prev !== null) {
-      const dist = haversineM(prev, f);
-      const dtMs = f.tMonoMs - prev.tMonoMs;
-      if (dist !== null && dtMs > 0) {
-        row.distCumM = cumM + dist;
-        cumM = row.distCumM;
-        row.dtMs = dtMs;
-        row.speedDerivedMps = dist / (dtMs / 1000);
-        row.paceSecPerKm = speedToPaceSecPerKm(row.speedDerivedMps);
-      } else {
-        row.distCumM = cumM;
-      }
-    }
-    // 优先用芯片报的速度算配速；没有才退回差分速度
-    const speedForPace =
-      row.speedMps !== null && Number.isFinite(row.speedMps)
-        ? row.speedMps
-        : row.speedDerivedMps;
-    row.paceSecPerKm = speedToPaceSecPerKm(speedForPace);
-    row.paceSpeedSource =
-      row.speedMps !== null && Number.isFinite(row.speedMps) ? "reported" : "derived";
-    if (row.speedSource === null && row.speedDerivedMps !== null) {
-      row.speedSource = "derived";
-    }
-    out.push(row);
-    prev = f;
+    const row = rawStep(prev, f);
+    raw.push(row);
+    prev = row;
   }
-  return out;
+  return annotateGpsQuality(raw);
+}
+
+/** 每来一个定位点只推进一步。结果与对全量再调用 deriveGpsTrack 一致。 */
+export function appendDerivedFix(track, fix) {
+  const prev = track.length ? track[track.length - 1] : null;
+  return appendAnnotated(track, rawStep(prev, fix));
 }

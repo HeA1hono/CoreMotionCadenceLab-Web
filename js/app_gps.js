@@ -24,8 +24,9 @@ import { makeSceneSignal } from "./synth.js";
 import { TimeBase } from "./timebase.js";
 import {
   RealGpsSource, ReplayGpsSource, parseGpx, guessProvenance,
-  deriveGpsTrack, formatPace, GpsOrigin, GpxProvenance, GpsState,
+  appendDerivedFix, GpsOrigin, GpxProvenance, GpsState,
 } from "./gps.js";
+import { GPS_QUALITY_ALGO, QUALITY_LABEL } from "./gps_quality.js";
 import {
   TimelineBuckets, Channel, analyzeIntervalDistribution,
   findGpsOutages, mergeOutages, speedAt,
@@ -101,8 +102,10 @@ function collectDom() {
     "mock-ribbon", "page-meta", "env-verdict", "env-list", "env-note",
     "perm-verdict", "perm-note", "btn-perm-motion", "btn-perm-gps", "btn-start", "btn-stop",
     "gps-state", "gps-origin", "gps-origin-sub", "sel-gps-mode", "file-gpx", "sel-gps-speed",
-    "m-gps-dist", "m-gps-pace", "m-gps-speed", "m-gps-acc", "m-gps-count", "m-gps-lat",
-    "gps-note", "gps-replay-note", "gps-provenance-note", "gps-err",
+    "m-gps-dist", "m-gps-dist-trusted", "m-gps-pace", "m-gps-pace-unit",
+    "m-gps-speed", "m-gps-acc", "m-gps-count", "m-gps-accepted", "m-gps-anomaly",
+    "m-gps-quality", "m-gps-lat",
+    "gps-note", "gps-quality-note", "gps-replay-note", "gps-provenance-note", "gps-err",
     "tl-state", "m-tl-motion", "m-tl-gps", "m-tl-buckets",
     "m-tl-outages", "m-tl-outage-ms", "m-tl-drift", "outage-note", "timeline-cap-note",
     "m-stride", "m-stride-verdict", "m-double-ratio", "stride-note",
@@ -224,7 +227,7 @@ function onGpsFix(fix) {
     ensureTimebase().anchorNow();
   }
   S.fixes.push(fix);
-  S.track = deriveGpsTrack(S.fixes);
+  appendDerivedFix(S.track, fix);
   ensureBuckets(S.t0PerfMs).add(Channel.GPS, fix.tMonoMs);
   // 有了第一个点就允许导出：允许导出比禁止导出更安全——
   // 导出的是一份带来源标记的真实记录，而不是一个"再等等"的空按钮。
@@ -358,12 +361,30 @@ function renderGps() {
   const last = track.length ? track[track.length - 1] : null;
   dom["m-gps-count"].textContent = String(S.fixes.length);
   dom["m-gps-dist"].textContent = last ? NUM(last.distCumM, 1) : "—";
-  const spd = preferredSpeed(last);
-  dom["m-gps-speed"].textContent = spd === null ? "—" : NUM(spd, 2);
+  if (dom["m-gps-dist-trusted"]) {
+    dom["m-gps-dist-trusted"].textContent = last ? NUM(last.distConfirmedM, 1) : "—";
+  }
+  const showSpeed = last && Number.isFinite(last.displaySpeedMps);
+  dom["m-gps-speed"].textContent = showSpeed ? NUM(last.displaySpeedMps, 2) : "—";
   dom["m-gps-acc"].textContent = last && Number.isFinite(last.accuracyM) ? NUM(last.accuracyM, 1) : "—";
-  dom["m-gps-pace"].textContent = last && Number.isFinite(last.paceSecPerKm)
-    ? formatPace(last.paceSecPerKm)
-    : "—";
+  dom["m-gps-pace"].textContent = last && last.paceDisplayText ? last.paceDisplayText : "—";
+  if (dom["m-gps-pace-unit"]) {
+    dom["m-gps-pace-unit"].textContent = last && last.paceDisplayKind === "pace" ? "/km" : "";
+  }
+  if (dom["m-gps-accepted"]) {
+    dom["m-gps-accepted"].textContent = last ? String(last.effectiveCount ?? 0) : "0";
+  }
+  if (dom["m-gps-anomaly"]) {
+    dom["m-gps-anomaly"].textContent = last ? String(last.anomalyCount ?? 0) : "0";
+  }
+  if (dom["m-gps-quality"]) {
+    dom["m-gps-quality"].textContent = last ? (QUALITY_LABEL[last.qualityState] || "—") : "—";
+  }
+  if (dom["gps-quality-note"]) {
+    dom["gps-quality-note"].textContent = last && last.qualityNote
+      ? last.qualityNote
+      : "开始采集后，这里说明原始路程和确认距离差在哪里。";
+  }
 
   const tb = S.timebase;
   if (tb && S.gpsOrigin === GpsOrigin.REAL && tb.observations.length) {
@@ -733,6 +754,15 @@ function exportDiag() {
         : null,
       accuracyMedianM: accs.length ? accs[accs.length >> 1] : null,
       speedSourceCounts,
+      qualityAlgo: last ? last.qualityAlgo ?? null : null,
+      confirmedDistanceM: last ? last.distConfirmedM : null,
+      ambiguousDistanceM: last ? last.distAmbiguousM : null,
+      openDistanceM: last ? last.distOpenM : null,
+      qualityState: last ? last.qualityState ?? null : null,
+      paceDisplay: last ? last.paceDisplayText ?? null : null,
+      displaySpeedMps: last ? last.displaySpeedMps : null,
+      anomalyCount: last ? last.anomalyCount ?? 0 : 0,
+      effectiveCount: last ? last.effectiveCount ?? 0 : 0,
     },
     outages: {
       gpsThresholdMs: info.thresholdMs,
@@ -1219,7 +1249,8 @@ function main() {
   bootEnvironment();
   bind();
   setGpsOrigin(GpsOrigin.NONE, "尚未选择 GPS 模式");
-  dom["footer-meta"].textContent = `E-W4 · 步频参数版本 ${new StepDetector({ source: "REAL" }).params.version}`;
+  dom["footer-meta"].textContent =
+    `E-W4.1 · 距离算法 ${GPS_QUALITY_ALGO} · 步频参数 ${new StepDetector({ source: "REAL" }).params.version}`;
   document.documentElement.setAttribute("data-lab-boot", "ok");
 
   // 自检放在 boot 之后：即使自检中途抛异常，冒烟检查也能区分

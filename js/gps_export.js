@@ -57,9 +57,17 @@ export const GPS_TRACK_CSV_HEADER = Object.freeze([
   "origin",
   "provenance",
   "replay_speed",
+  "dist_confirmed_m",
+  "dist_ambiguous_m",
+  "dist_open_m",
+  "segment_code",
+  "quality_state",
+  "pace_display",
+  "display_speed_mps",
+  "quality_algo",
 ]);
 
-export const GPS_TRACK_CSV_VERSION = "1.0";
+export const GPS_TRACK_CSV_VERSION = "1.1";
 
 export const TIMELINE_CSV_HEADER = Object.freeze([
   "bucket_index",
@@ -80,7 +88,7 @@ export const TIMELINE_CSV_HEADER = Object.freeze([
 export const TIMELINE_CSV_VERSION = "1.0";
 
 export const GPS_DIAG_SCHEMA = "core-motion-cadence-lab/web-lab/gps-timeline";
-export const GPS_DIAG_SCHEMA_VERSION = "1.0";
+export const GPS_DIAG_SCHEMA_VERSION = "1.1";
 
 /** CSV 单元格转义：含分隔符/引号/换行时加引号。null → 空。 */
 function cell(v, sep = ",") {
@@ -141,6 +149,14 @@ export function buildGpsTrackCsv(fixes, meta = {}) {
         cell(origin),
         cell(f.provenance ?? meta.provenance ?? GpxProvenance.UNKNOWN),
         cell(f.replaySpeed ?? null),
+        cell(round(f.distConfirmedM, 2)),
+        cell(round(f.distAmbiguousM, 2)),
+        cell(round(f.distOpenM, 2)),
+        cell(f.segmentCode ?? null),
+        cell(f.qualityState ?? null),
+        cell(f.paceDisplayText ?? null),
+        cell(round(f.displaySpeedMps, 3)),
+        cell(f.qualityAlgo ?? null),
       ].join(","),
     );
   }
@@ -224,6 +240,15 @@ export function buildGpsDiagJson(payload = {}) {
       mean_pace_text: formatPace(payload.gps ? payload.gps.meanPaceSecPerKm : null),
       accuracy_median_m: payload.gps ? round(payload.gps.accuracyMedianM, 2) : null,
       speed_source_counts: payload.gps ? payload.gps.speedSourceCounts ?? {} : {},
+      quality_algo: payload.gps ? payload.gps.qualityAlgo ?? null : null,
+      confirmed_distance_m: payload.gps ? round(payload.gps.confirmedDistanceM, 2) : null,
+      ambiguous_distance_m: payload.gps ? round(payload.gps.ambiguousDistanceM, 2) : null,
+      open_distance_m: payload.gps ? round(payload.gps.openDistanceM, 2) : null,
+      quality_state: payload.gps ? payload.gps.qualityState ?? null : null,
+      pace_display: payload.gps ? payload.gps.paceDisplay ?? null : null,
+      display_speed_mps: payload.gps ? round(payload.gps.displaySpeedMps, 3) : null,
+      anomaly_count: payload.gps ? payload.gps.anomalyCount ?? null : null,
+      effective_count: payload.gps ? payload.gps.effectiveCount ?? null : null,
     },
     outages: {
       // 只算定位断档：这一项的阈值是自适应的，由定位点自身的中位间隔决定，
