@@ -65,9 +65,15 @@ export const GPS_TRACK_CSV_HEADER = Object.freeze([
   "pace_display",
   "display_speed_mps",
   "quality_algo",
+  "dt_sample_ms",
+  "speed_sample_mps",
+  "speed_arrival_mps",
+  "time_basis",
+  "delivery",
+  "point_reason",
 ]);
 
-export const GPS_TRACK_CSV_VERSION = "1.1";
+export const GPS_TRACK_CSV_VERSION = "1.2";
 
 export const TIMELINE_CSV_HEADER = Object.freeze([
   "bucket_index",
@@ -157,6 +163,12 @@ export function buildGpsTrackCsv(fixes, meta = {}) {
         cell(f.paceDisplayText ?? null),
         cell(round(f.displaySpeedMps, 3)),
         cell(f.qualityAlgo ?? null),
+        cell(f.dtSampleMs === undefined || f.dtSampleMs === null ? null : Math.round(f.dtSampleMs)),
+        cell(round(f.speedSampleMps, 3)),
+        cell(round(f.speedArrivalMps, 3)),
+        cell(f.speedTimeBasis ?? null),
+        cell(f.delivery ?? null),
+        cell(f.pointReason ?? null),
       ].join(","),
     );
   }

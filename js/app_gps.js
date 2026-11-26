@@ -1250,7 +1250,7 @@ function main() {
   bind();
   setGpsOrigin(GpsOrigin.NONE, "尚未选择 GPS 模式");
   dom["footer-meta"].textContent =
-    `E-W4.1 · 距离算法 ${GPS_QUALITY_ALGO} · 步频参数 ${new StepDetector({ source: "REAL" }).params.version}`;
+    `E-W4.2 · 距离算法 ${GPS_QUALITY_ALGO} · 步频参数 ${new StepDetector({ source: "REAL" }).params.version}`;
   document.documentElement.setAttribute("data-lab-boot", "ok");
 
   // 自检放在 boot 之后：即使自检中途抛异常，冒烟检查也能区分

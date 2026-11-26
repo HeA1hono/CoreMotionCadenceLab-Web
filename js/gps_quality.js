@@ -16,11 +16,15 @@
  * 没有精度字段（GPX 回放常见）时，做不了这道门。这时只剔除时间倒退、
  * 超高速跳点和长时间中断，并标明 `no_accuracy`。这种结果不能用来
  * 证明真实 GPS 准不准。
+ *
+ * 速度用的时间：两点都有采样时刻（`tEpochMs`，位置确定的时间）时，
+ * 用采样间隔。到达时刻（`tMonoMs`）只说明网页何时收到这个点。
+ * 两把钟都保留，不把到达间隔拿去冒充采样间隔。
  */
 
 import { formatPace, haversineM } from "./gps.js";
 
-export const GPS_QUALITY_ALGO = "ew4.1.1";
+export const GPS_QUALITY_ALGO = "ew4.2.0";
 
 /**
  * 沿轨迹方向，两端独立高斯误差之差超过 2σ 的概率约 4.6%。
@@ -113,14 +117,48 @@ function median(xs) {
 }
 
 function snap(fix) {
+  const epoch = fix && fix.tEpochMs;
+  const tSample = typeof epoch === "number" && Number.isFinite(epoch) ? epoch : null;
+  const tArrival = Number(fix.tMonoMs);
   return {
     lat: Number(fix.lat),
     lon: Number(fix.lon),
-    t: fix.tMonoMs,
+    // 窗口内部的 t 是运动学时间：有采样时刻就用采样时刻，否则才用到达时刻。
+    t: tSample !== null ? tSample : tArrival,
+    tArrival,
+    tSample,
     acc: accOf(fix),
     seg: 0,
     reported: finiteNonNeg(fix.speedMps),
   };
+}
+
+function kinBetween(prev, point) {
+  const dtArrival = point.tArrival - prev.tArrival;
+  if (prev.tSample !== null && point.tSample !== null) {
+    return { dt: point.tSample - prev.tSample, basis: "sample", dtArrival };
+  }
+  return { dt: dtArrival, basis: "arrival", dtArrival };
+}
+
+function localReason(delivery, v, reported) {
+  if (delivery === "batched" && v < DISPLAY_UNRELIABLE_MPS) return "late_delivery";
+  if (delivery === "batched") return "late_delivery_noisy";
+  if (v >= DISPLAY_UNRELIABLE_MPS) {
+    return reported === 0 ? "reported_zero_but_fast_step" : "noisy_unconfirmed";
+  }
+  if (reported === 0 && v <= STATIONARY_MPS) return "reported_zero_small_step";
+  if (reported === 0) return "reported_zero_unconfirmed";
+  return "within_uncertainty";
+}
+
+function deliveryClass(kin) {
+  const dtA = kin.dtArrival;
+  const dtS = kin.basis === "sample" ? kin.dt : null;
+  if (!(dtS > 0) || !(dtA > 0)) return "unknown";
+  if (dtA < 250 && dtS > Math.max(500, dtA * 5)) return "batched";
+  if (Math.abs(dtS - dtA) <= Math.max(250, 0.25 * Math.max(dtS, 1))) return "aligned";
+  return "skewed";
 }
 
 function cloneCursor(c) {
@@ -155,6 +193,10 @@ function emptyCursor(fix) {
     lastCommitT: null,
     lastCommitCode: null,
     lastCode: "origin",
+    pointReason: "origin",
+    delivery: "none",
+    kinBasis: null,
+    kinSpeed: null,
     origins: fix.origin ? [fix.origin] : [],
   };
 }
@@ -186,7 +228,7 @@ function nearCluster(point, spikes, geom) {
   const last = spikes[spikes.length - 1];
   const d = haversineM(last, point);
   if (d === null) return false;
-  const sig = rss(last.acc, accOf(point));
+  const sig = rss(last.acc, point.acc !== undefined && point.acc !== null ? point.acc : accOf(point));
   if (sig !== null) return d <= SIGMA_FACTOR * sig;
   const dGeom = haversineM(geom, point);
   if (dGeom === null) return false;
@@ -261,7 +303,7 @@ function tryCommit(cursor) {
       cursor.lastCode = "confirmed";
     }
     cursor.lastCommitSpeed = stats.vNet;
-    cursor.lastCommitT = stats.endT;
+    cursor.lastCommitT = end.tArrival;
     const kept = { ...end, seg: 0 };
     cursor.buffer = [kept];
     cursor.anchor = kept;
@@ -383,6 +425,14 @@ export function buildQualityNote(row) {
   }
   if (row.excludedSpikeM > 0) bits.push(`异常跳点 ${fmtM(row.excludedSpikeM)} m 已隔开。`);
   if (row.excludedGapM > 0) bits.push(`中断两侧没有连上，隔开的 ${fmtM(row.excludedGapM)} m 只留在原始路程里。`);
+  if (row.delivery === "batched") {
+    bits.push("有定位点是成批迟到的：速度按采样间隔计算，没有把几毫秒的到达间隔当成高速。");
+  }
+  if (row.speedMps === 0 && Number.isFinite(row.speedSampleMps) && row.speedSampleMps > 1) {
+    bits.push("芯片速度为 0，但采样间隔上的位移并不像静止。0 是设备报告，这段没有计入确认距离。");
+  } else if (row.speedMps === 0 && row.paceDisplayKind === "stationary") {
+    bits.push("芯片速度为 0，对应采样位移也小。这不能单独证明整次实验都没移动。");
+  }
   if (STATE_NOTE[row.qualityState]) bits.push(STATE_NOTE[row.qualityState]);
   if (row.paceDisplayKind === "stationary") bits.push("速度接近零，不换算配速。");
   if (row.paceDisplayKind === "unreliable") bits.push("当前差分速度不可靠，不显示配速。");
@@ -400,6 +450,10 @@ function finish(cursor, raw) {
   row.distAmbiguousM = cursor.ambiguous;
   row.distOpenM = cursor.openPath;
   row.segmentCode = cursor.lastCode;
+  row.pointReason = cursor.pointReason;
+  row.delivery = cursor.delivery;
+  row.kinBasis = cursor.kinBasis;
+  row.kinSpeedMps = cursor.kinSpeed;
   row.qualityAlgo = GPS_QUALITY_ALGO;
   row.committedSpeedMps = cursor.lastCommitSpeed;
   row.committedAtMs = cursor.lastCommitT;
@@ -428,36 +482,39 @@ function applyOne(prev, raw) {
   noteOrigin(cursor, raw);
   const segRaw = rawSegM(raw);
 
-  const point = {
-    lat: Number(raw.lat),
-    lon: Number(raw.lon),
-    tMonoMs: raw.tMonoMs,
-    accuracyM: raw.accuracyM,
-    speedMps: raw.speedMps,
-  };
-  if (!Number.isFinite(point.lat) || !Number.isFinite(point.lon) || !Number.isFinite(point.tMonoMs)) {
+  const located = snap(raw);
+  if (!Number.isFinite(located.lat) || !Number.isFinite(located.lon) || !Number.isFinite(located.tArrival)) {
     cursor.anomaly += 1;
     cursor.pointCount += 1;
     cursor.lastCode = "bad_coords";
+    cursor.pointReason = "bad_coords";
     return finish(cursor, raw);
   }
 
-  const distG = haversineM(cursor.geom, point);
-  const dtG = point.tMonoMs - cursor.geom.t;
+  const distG = haversineM(cursor.geom, located);
+  const kin = kinBetween(cursor.geom, located);
+  const dtG = kin.dt;
+  cursor.kinBasis = kin.basis;
+  cursor.delivery = deliveryClass(kin);
   if (distG === null) {
     cursor.anomaly += 1;
     cursor.pointCount += 1;
     cursor.lastCode = "bad_coords";
+    cursor.pointReason = "bad_coords";
     return finish(cursor, raw);
   }
   if (!(dtG > 0)) {
     cursor.anomaly += 1;
     cursor.pointCount += 1;
     cursor.lastCode = dtG < 0 ? "time_rewind" : "time_duplicate";
+    cursor.pointReason = kin.basis === "sample"
+      ? (dtG < 0 ? "sample_time_rewind" : "sample_time_duplicate")
+      : cursor.lastCode;
     return finish(cursor, raw);
   }
 
   const vG = distG / (dtG / 1000);
+  cursor.kinSpeed = vG;
   if (longGap(cursor, dtG)) {
     cursor.excludedGap += segRaw > 0 ? segRaw : distG;
     cursor.accepted += 1;
@@ -469,19 +526,24 @@ function applyOne(prev, raw) {
     cursor.geom = s;
     cursor.openPath = 0;
     cursor.lastCode = "gap";
+    cursor.pointReason = kin.basis === "sample" ? "sample_gap" : "arrival_gap";
     return finish(cursor, raw);
   }
 
   const reported = finiteNonNeg(raw.speedMps);
   const absurd = vG > ABSURD_SPEED_MPS && (reported === null || reported < vG * 0.5);
-  const inCluster = cursor.pendingSpikes.length > 0 && nearCluster(point, cursor.pendingSpikes, cursor.geom);
-  if (absurd || inCluster) {
+  // 只有「仍远在上一个可信点的精度门外」的点才延续跳点簇。
+  // 精度恢复后回到门内的点必须退出，不能因为曾经邻近一个异常点就一直算 spike。
+  const farSig = rss(cursor.geom.acc, located.acc);
+  const far = farSig === null ? true : distG > SIGMA_FACTOR * farSig;
+  const continuingTeleport = cursor.pendingSpikes.length > 0
+    && far
+    && nearCluster(located, cursor.pendingSpikes, cursor.geom);
+  if (absurd || continuingTeleport) {
     cursor.anomaly += 1;
     cursor.pointCount += 1;
     cursor.excludedSpike += segRaw > 0 ? segRaw : distG;
     cursor.pendingSpikes.push(snap(raw));
-    const farSig = rss(cursor.geom.acc, accOf(raw));
-    const far = farSig === null ? true : distG > SIGMA_FACTOR * farSig;
     if (cursor.pendingSpikes.length >= REACQUIRE_COUNT && far) {
       const s = snap(raw);
       cursor.buffer = [s];
@@ -490,13 +552,18 @@ function applyOne(prev, raw) {
       cursor.openPath = 0;
       cursor.pendingSpikes = [];
       cursor.lastCode = "reacquire";
+      cursor.pointReason = "reacquire_after_teleport";
     } else {
       cursor.lastCode = "spike";
+      cursor.pointReason = absurd
+        ? (kin.basis === "sample" ? "absurd_sample_speed" : "absurd_arrival_speed")
+        : "teleport_cluster";
     }
     return finish(cursor, raw);
   }
 
   cursor.pendingSpikes = [];
+  cursor.pointReason = localReason(cursor.delivery, vG, reported);
 
   const accPoint = accOf(raw);
   const accGeom = cursor.geom.acc;
@@ -514,12 +581,13 @@ function applyOne(prev, raw) {
         cursor.geom = s;
         cursor.openPath = 0;
         cursor.lastCode = "gap";
+        cursor.pointReason = "short_gap_inconsistent";
         return finish(cursor, raw);
       }
     }
     cursor.trusted += distG;
     cursor.lastCommitSpeed = vG;
-    cursor.lastCommitT = point.tMonoMs;
+    cursor.lastCommitT = located.tArrival;
     cursor.lastCommitCode = bridged ? "no_accuracy_bridged" : "no_accuracy";
     cursor.lastCode = cursor.lastCommitCode;
     cursor.openPath = 0;
@@ -543,6 +611,9 @@ function applyOne(prev, raw) {
   rememberGap(cursor, dtG);
 
   const committed = tryCommit(cursor);
+  if (committed) {
+    cursor.pointReason = cursor.lastCode === "ambiguous" ? "reported_contradicts_motion" : "confirmed_net";
+  }
   if (!committed && cursor.lastCode !== "drift") {
     cursor.lastCode = "within_uncertainty";
   }

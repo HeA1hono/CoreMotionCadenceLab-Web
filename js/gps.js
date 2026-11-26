@@ -1,44 +1,22 @@
 /**
- * GPS 数据源：真实定位（Geolocation API）与离线回放（GPX）。
- *
- * ## 两类来源的差别不是"精度"，而是"这条数据是怎么来的"
- *
- *   REAL_GPS —— `navigator.geolocation.watchPosition` 拿到的实测定位。
- *               每个点带 `Position.timestamp`（epoch 毫秒，位置确定时刻），
- *               但**没有**速度保证：`coords.speed` 在 iOS 上经常是 null。
- *
- *   REPLAY   —— 从 GPX 文件按时间线播出来的点。**它不是测量**。
- *               更麻烦的是：本仓库可用的 GPX 全部由跑道几何参数生成
- *               （见 E:\虚拟定位工具\tracks\*.gpx 的 <desc>），
- *               连"某次真实跑步的记录"都不是。因此回放数据必须同时携带
- *               `origin=REPLAY` 与 `provenance`，后者说明"这个 GPX 自己是哪来的"。
- *
- * ## 不做的事
- *
- *   - 不把 GPX 回放冒充真实定位（origin 字段是硬标记，导出的每一行都带）；
- *   - 不把 GPS 配速换算成步数（见 alignment.js 的注释：那会造出假步数）；
- *   - 不向系统定位服务写入任何东西——本模块只读 `watchPosition`。
+ * GPS 源与原始路程。REAL_GPS / REPLAY 分开。maximumAge 默认 0。
+ * 原始路程按到达顺序累加。有采样时刻时，差分速度用采样间隔，到达速度另存。
  */
 
 import { annotateGpsQuality, appendAnnotated } from "./gps_quality.js";
 
-/** 数据来源。这是导出与界面上的**第一分类**，不允许被省略或合并。 */
 export const GpsOrigin = Object.freeze({
   REAL: "REAL_GPS",
   REPLAY: "REPLAY",
   NONE: "NONE",
 });
 
-/**
- * GPX 文件自身的来历。`origin=REPLAY` 只说明"这是回放"，
- * 不说明"回放的内容是真实轨迹"。两者必须分开。
- */
 export const GpxProvenance = Object.freeze({
-  /** 由几何/参数生成，不对应任何一次真实运动 */
+  
   SYNTHETIC_GEOMETRY: "synthetic_geometry",
-  /** 某次真实运动的记录 */
+  
   RECORDED: "recorded",
-  /** 无法判断。默认值——**不默认成 recorded** */
+  
   UNKNOWN: "unknown",
 });
 
@@ -55,18 +33,10 @@ export const GpsState = Object.freeze({
 
 const EARTH_RADIUS_M = 6371008.8;
 
-/** 度 → 弧度 */
 function rad(deg) {
   return (deg * Math.PI) / 180;
 }
 
-/**
- * 两点间大圆距离（米）。
- *
- * 用 haversine 而不是平面近似：本项目在湘潭（纬度 27.9°），1 度经度约 98 km，
- * 400 m 跑道范围内平面近似误差在厘米级、够用；但一旦回放跨校区轨迹，
- * 平面近似会随距离线性跑偏。haversine 的代价只是两个 sin，不值得省。
- */
 export function haversineM(a, b) {
   if (!a || !b) return null;
   const lat1 = Number(a.lat);
@@ -82,13 +52,11 @@ export function haversineM(a, b) {
   return 2 * EARTH_RADIUS_M * Math.asin(Math.min(1, Math.sqrt(s)));
 }
 
-/** 米/秒 → 秒/公里（配速）。速度 ≤ 0 时返回 null，不返回 Infinity。 */
 export function speedToPaceSecPerKm(mps) {
   if (!Number.isFinite(mps) || mps <= 0) return null;
   return 1000 / mps;
 }
 
-/** 秒/公里 → "5:00" 形式。 */
 export function formatPace(secPerKm) {
   if (!Number.isFinite(secPerKm) || secPerKm <= 0) return "—";
   const total = Math.round(secPerKm);
@@ -99,23 +67,6 @@ export function formatPace(secPerKm) {
 
 // ---------------------------------------------------------------- GPX 解析
 
-/**
- * 宽松的 GPX 解析。
- *
- * 为什么手写而不用 DOMParser：Node 里没有 DOMParser，而这段逻辑必须能被单测
- * 直接覆盖（回放的时间线、缺 time 的兜底、命名空间差异都是会出错的地方）。
- * 手写解析只支持一个结构：`<trk><trkseg><trkpt lat lon>`——与
- * `E:\虚拟定位工具\README.md` 第 8 节记录的支持范围一致，其余结构显式报错，
- * 不做"猜一个"的兜底。
- *
- * 时间格式按同一份文档的说明放宽：允许空格代替 `T`、允许非补零、
- * 允许 `Z` 或 `±HH:MM`。
- *
- * @param {string} xmlText
- * @returns {{points: Array<{lat:number, lon:number, tEpochMs:number|null, ele:number|null, index:number}>,
- *            meta: {name:string|null, desc:string|null, timeText:string|null},
- *            hasTime: boolean}}
- */
 export function parseGpx(xmlText) {
   if (typeof xmlText !== "string" || xmlText.length === 0) {
     throw new Error("GPX 内容为空");
@@ -184,7 +135,6 @@ function readAttr(attrs, name) {
   return m2 ? m2[1] : null;
 }
 
-/** 取第一个匹配的标签文本内容。`skip` 用于跳过 metadata 里的同名标签。 */
 function matchTag(text, tag, skip = -1) {
   const re = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</${tag}>`, "gi");
   let seen = 0;
@@ -199,12 +149,6 @@ function matchTag(text, tag, skip = -1) {
   return null;
 }
 
-/**
- * 解析 GPX 时间。返回 epoch 毫秒，失败返回 null（不抛——一个坏时间不该毁掉整条轨迹）。
- *
- * 支持：`2026-11-18T01:00:00Z`、`2026-11-18 01:00:00`、`2026-11-18T01:00:00.500+08:00`、
- * 非补零的 `2026-11-18T1:0:0Z`。
- */
 export function parseGpxTime(text) {
   if (typeof text !== "string") return null;
   const s = text.trim();
@@ -232,16 +176,6 @@ export function parseGpxTime(text) {
   return base - offsetMin * 60000;
 }
 
-/**
- * 从 `<desc>` 猜 GPX 的来历。
- *
- * 只作**提示**，不作定论：真实来源必须由调用方显式声明（`provenance` 参数）。
- * 返回 `null` 表示"猜不出来"，调用方应落到 `UNKNOWN`。
- *
- * 为什么需要这个提示：本仓库能拿到的 GPX 全是几何生成的，但文件名
- * （`xtu2_5km_5min_pace.gpx`）看起来非常像一次真实跑步。若不定 provenance，
- * 导出物会被后来的人当成实测数据。
- */
 export function guessProvenance(meta) {
   const text = `${(meta && meta.name) || ""} ${(meta && meta.desc) || ""}`.toLowerCase();
   if (text.trim() === "") return null;
@@ -256,17 +190,6 @@ export function guessProvenance(meta) {
 
 // ---------------------------------------------------------------- 真实 GPS
 
-/**
- * 真实定位源。
- *
- * 【关键设计】`maximumAge` 默认 0。
- *   它允许浏览器直接返回缓存位置，是"看起来有数据、其实是几分钟前的点"的
- *   主要来源。E-W4 要研究 GPS 延迟，必须先把缓存这个混淆项关掉；
- *   若要研究缓存行为，把它设成非 0 并单独标注。
- *
- * 【权限】`getCurrentPosition`/`watchPosition` 在 Safari 上需要用户手势触发，
- *   与 DeviceMotion 同理。本模块不做任何预热请求。
- */
 export class RealGpsSource {
   constructor(opts = {}) {
     this.win = opts.win ?? globalThis;
@@ -356,7 +279,7 @@ export class RealGpsSource {
       try {
         this.win.navigator.geolocation.clearWatch(this._watchId);
       } catch {
-        /* 清理失败不影响状态机 */
+        
       }
     }
     this._watchId = null;
@@ -366,14 +289,6 @@ export class RealGpsSource {
   }
 }
 
-/**
- * 把 GeolocationPosition 归一化成内部 fix。
- *
- * `coords.speed` 与 `coords.heading` 在 iOS 上**经常是 null**（尤其精度差时）。
- * 这里原样保留，同时把"有没有这个字段"记下来：
- * 后续若用相邻点差分算速度，必须标成 `speed_source="derived"`，
- * 不能和 GPS 芯片自己报的速度混为一谈。
- */
 export function normalizePosition(pos, arrivalPerfMs, seq = 0) {
   const c = (pos && pos.coords) || {};
   const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
@@ -396,29 +311,8 @@ export function normalizePosition(pos, arrivalPerfMs, seq = 0) {
 
 // ---------------------------------------------------------------- GPX 回放
 
-/**
- * GPX 回放源。
- *
- * 时间语义是本模块最容易出错的地方，说清楚：
- *   - GPX 里的 `<time>` 属于**文件作者那一侧的 epoch 域**，与本次会话的
- *     `performance.now()` 没有任何关系。所以回放时**不能**用 TimeBase 的锚点。
- *   - 回放自己维持一条时间线：`perfNow = perfStart + (fileEpoch − fileStart)/speed`。
- *   - 因此回放的"延迟"恒等于 0（是我们按点播出来的，不是测出来的）。
- *     导出时必须带 `origin=REPLAY`，否则这个 0 会被当成"GPS 性能极好"。
- *
- * 缺 `<time>` 的 GPX 按 `fallbackIntervalSec`（默认 1 秒）等距回放，
- * 并在 meta 里标 `time_synthesized=true`——那是**我们编的时间**，不是文件里的。
- */
 export class ReplayGpsSource {
-  /**
-   * @param {object} opts
-   * @param {object} opts.gpx parseGpx 的返回值
-   * @param {number} [opts.speed] 回放倍速，1 = 按原速
-   * @param {number} [opts.fallbackIntervalSec] 缺 time 时的点间隔
-   * @param {string} [opts.provenance] 显式声明的 GPX 来历
-   * @param {(fn:Function, ms:number)=>any} [opts.setTimeoutFn]
-   * @param {() => number} [opts.perfNow]
-   */
+  
   constructor(opts = {}) {
     if (!opts.gpx || !Array.isArray(opts.gpx.points) || opts.gpx.points.length === 0) {
       throw new Error("ReplayGpsSource 需要非空的 parseGpx 结果");
@@ -451,12 +345,12 @@ export class ReplayGpsSource {
     this._paused = false;
   }
 
-  /** 回放时间线：文件 epoch → 本次会话 perf */
+  
   fileToPerf(tEpochMs) {
     return this._perfStart + (tEpochMs - this._fileStartEpoch) / this.speed;
   }
 
-  /** 本次会话 perf → 文件 epoch（调试图表用） */
+  
   perfToFile(perfMs) {
     return this._fileStartEpoch + (perfMs - this._perfStart) * this.speed;
   }
@@ -582,31 +476,48 @@ export class ReplayGpsSource {
   }
 }
 
-/**
- * 从 fix 序列计算派生量：累计距离、分段速度、配速。
- *
- * 速度来源分三种，**必须分别标注**，不能混成一个 speed 列：
- *   - `reported`：GPS 芯片自己报的（`coords.speed`），可信但常为 null；
- *   - `derived` ：由相邻两点的距离/时间算出；
- *   - `null`    ：算不出来（时间不前进、点数不足）。
- *
- * 差分算出的速度对定位噪声极其敏感：GPS 抖动 5 m、间隔 1 s，就能造出 5 m/s
- * 的假速度。`distCumM` 仍是这条原始路程，方便对照漂移；确认距离、配速能不能
- * 显示，在 `gps_quality.js` 里另算，不回写经纬度。
- *
- * @param {Array<object>} fixes 按 tMonoMs 升序
- * @returns {Array<object>} 每个 fix 附带派生字段的新数组
- */
 function rawStep(prevRow, f) {
   const cumM = prevRow ? prevRow.distCumM : 0;
-  const row = { ...f, distCumM: cumM, speedDerivedMps: null, paceSecPerKm: null, dtMs: null };
+  const row = {
+    ...f,
+    distCumM: cumM,
+    speedDerivedMps: null,
+    speedArrivalMps: null,
+    speedSampleMps: null,
+    paceSecPerKm: null,
+    dtMs: null,
+    dtArrivalMs: null,
+    dtSampleMs: null,
+    speedTimeBasis: null,
+  };
   if (prevRow) {
     const dist = haversineM(prevRow, f);
-    const dtMs = f.tMonoMs - prevRow.tMonoMs;
-    if (dist !== null && dtMs > 0) {
+    const dtArrival = Number(f.tMonoMs) - Number(prevRow.tMonoMs);
+    const haveSample = Number.isFinite(f.tEpochMs) && Number.isFinite(prevRow.tEpochMs);
+    const dtSample = haveSample ? Number(f.tEpochMs) - Number(prevRow.tEpochMs) : null;
+    // 原始路程仍按「到达顺序里时间向前」累加，不改用另一把钟重算这条对照值。
+    if (dist !== null && dtArrival > 0) {
       row.distCumM = cumM + dist;
-      row.dtMs = dtMs;
-      row.speedDerivedMps = dist / (dtMs / 1000);
+      row.dtMs = dtArrival;
+      row.dtArrivalMs = dtArrival;
+      row.speedArrivalMps = dist / (dtArrival / 1000);
+    } else if (Number.isFinite(dtArrival)) {
+      row.dtArrivalMs = dtArrival;
+    }
+    row.dtSampleMs = dtSample;
+    if (dist !== null && dtSample !== null && dtSample > 0) {
+      row.speedSampleMps = dist / (dtSample / 1000);
+    }
+    // 有采样时刻时，差分速度用采样间隔。到达间隔只留在 speedArrivalMps，
+    // 避免把「一次性吐出的迟到点」算成几百米每秒。没有采样时刻才退回到达间隔。
+    if (row.speedSampleMps !== null) {
+      row.speedDerivedMps = row.speedSampleMps;
+      row.speedTimeBasis = "sample";
+    } else if (dtSample === null && row.speedArrivalMps !== null) {
+      row.speedDerivedMps = row.speedArrivalMps;
+      row.speedTimeBasis = "arrival";
+    } else if (dtSample !== null && !(dtSample > 0)) {
+      row.speedTimeBasis = "sample_rejected";
     }
   }
   // 数学配速保留原口径：芯片速度优先，没有才用差分。页面显示不直接用它。
@@ -635,7 +546,6 @@ export function deriveGpsTrack(fixes) {
   return annotateGpsQuality(raw);
 }
 
-/** 每来一个定位点只推进一步。结果与对全量再调用 deriveGpsTrack 一致。 */
 export function appendDerivedFix(track, fix) {
   const prev = track.length ? track[track.length - 1] : null;
   return appendAnnotated(track, rawStep(prev, fix));
